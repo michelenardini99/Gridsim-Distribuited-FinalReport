@@ -1,9 +1,13 @@
-\documentclass{scrartcl}
+\documentclass{scrreprt}
 \usepackage[utf8]{inputenc}
 \usepackage{hyperref}
 \usepackage{url}
 \usepackage{natbib}
 \usepackage{graphicx}
+\usepackage{longtable}                                                    
+\usepackage{array}
+\usepackage{booktabs}
+\usepackage[table]{xcolor}
 \usepackage{cleveref} % this must be the last package to be loaded
 
 \newcommand{\emailaddr}[1]{\href{mailto:#1}{\texttt{#1}}}
@@ -36,58 +40,9 @@
     Up to $\sim$2000 characters briefly describing the project.
 \end{abstract}
 
-\section*{Disclaimer (if needed)}
+\chapter{Concept}\label{concept}
 
-During the preparation of this work, the author(s) used [NAME TOOL / SERVICE] to [REASON].
-
-After using this tool/service, 
-the author(s) reviewed and edited the content as needed 
-and take(s) full responsibility for the content of the final report/artifact.
-
-\section*{Quick \LaTeX{} suggestions}
-
-If you need to cite a reference, you can use the \texttt{cite} command, 
-like providing the BibTex key of some entry in the \texttt{references.bib} file, 
-e.g.: \cite{adams1995hitchhiker}.
-
-You can find pre-coocked BibTex entries for most Computer Science papers on \href{https://dblp.uni-trier.de/}{DBLP}.
-
-If you need to include an image,
-let \LaTeX{} decide where to put it by using the \texttt{figure} environment,
-with a \texttt{includegraphics} command inside it.
-%
-If your need to reference a figure,
-use the \texttt{label} command to assign a label to the figure,
-and then use the \texttt{cref} command to reference it.
-%
-Put figures in the \texttt{figures} folder.
-%
-A complete example is shown in \cref{fig:universe}.
-
-\begin{figure}
-    \centering
-    \includegraphics[width=0.5\textwidth]{figures/universe.jpg}
-    \caption{This is an example image}
-    \label{fig:universe}
-\end{figure}
-
-Do \textbf{not} put any placement constraint on figures,
-such as \texttt{[h]} or \texttt{[h!]}.
-%
-Same considerations apply for other floating elements 
-(e.g. tables, algorithms, listings, etc.).
-
-Do \textbf{not} use the \texttt{\textbackslash\textbackslash} or \texttt{\textbackslash newline} commands to break lines.
-
-Just leave an empty line between two paragraphs to start a new one.
-%
-The new line will be automatically indented.
-%
-This is intended: it is the \LaTeX{} way to separate capoverses.
-
-\section{Concept}\label{concept}
-
-\subsection{Type of product}
+\section{Type of product}
 
 GridSim is a distributed desktop application for energy micro-grid simulation, composed of
 a backend simulation engine and a graphical client, which can be deployed either as a
@@ -117,7 +72,7 @@ In addition to the interactive product, the project also provides a small embedd
 Specific Language (DSL), written in Scala, used to declaratively describe a micro-grid
 scenario (houses, solar panels, batteries, cables, external grid, weather profile).
 
-\subsection{Use case}
+\section{Use case}
 
 GridSim models a local energy micro-grid as a directed graph: nodes are energy entities
 (houses, standalone solar panels, battery storages, and a single "External Grid" node
@@ -160,7 +115,7 @@ In this project, data is closer to "simulation state" than classic personal user
     without querying the backend state directly.
 \end{itemize}
 
-\subsection{Distribution motivations}
+\section{Distribution motivations}
 
 Distribution in GridSim is motivated by a combination of factors; the dominant ones are
 resource sharing/separation of concerns and fault tolerance, with computation parallelism
@@ -187,107 +142,439 @@ and geographic distribution as secondary but still relevant drivers.
     analysts from different workstations.
 \end{itemize}
 
-\section{Requirements Elicitation and Analysis}\label{requirements}
+\chapter{Requirements Elicitation and Analysis}\label{requirements}
 
-\begin{itemize}
-  \item The requirements must explain \textbf{what} (not how) the software
-  being produced should do.
-  %
-  \begin{itemize}
-    \item you should not focus on the particular problems, but exclusively on
-    what you want the application to do.
-  \end{itemize}
+  This chapter lists the requirements of GridSim, independently of how they
+  are
+  implemented. Each requirement is identified by a code
+  (\texttt{FR-}\textit{n}
+  for functional, \texttt{NFR-}\textit{n} for non-functional,
+  \texttt{IR-}\textit{n}
+  for implementation requirements) and comes with an acceptance criterion
+  that
+  will be used during validation and testing. Domain-specific terms are
+  collected in the glossary at the end of the chapter.
 
-  \item Requirements must be clearly identified, and possibly numbered
+  \section{Functional Requirements}
+  \label{sec:functional-requirements}
 
-  \item Requirements are divided into:
-  %
-  \begin{itemize}
-    \item \textbf{Functional}: some functionality the software should provide to the user
+  \begin{longtable}{@{}p{1.5cm} p{6.3cm} p{6.3cm}@{}}
+  \toprule
+  \textbf{ID} & \textbf{Requirement} & \textbf{Acceptance criterion} \\
+  \midrule
+  \endfirsthead
+  \toprule
+  \textbf{ID} & \textbf{Requirement} & \textbf{Acceptance criterion} \\
+  \midrule
+  \endhead
+  \bottomrule
+  \endfoot
 
-    \item \textbf{Non-functional}: requirements that do not directly concern behavioural aspects, such as consistency, availability, etc.
+  FR-1 &
+  The user shall be able to define a micro-grid scenario (houses, solar
+  panels,
+  battery storages, cables, external grid, weather profile, tick duration)
+  through a declarative Domain Specific Language (DSL). &
+  A scenario written with the DSL is successfully translated into a valid
+  static model and an initial simulation state, without manual
+  post-editing. \\
 
-    \item \textbf{Implementation}: constrain the entire phase of system realization, 
-    for instance by requiring the use of a specific programming language and/or a specific software tool
-    %
-    \begin{itemize}
-      \item these constraints should be adequately justified by political / economic / administrative reasons\ldots{}
-      \item \ldots{} otherwise, implementation choices should emerge \emph{as  a consequence of} design
-    \end{itemize}
-  \end{itemize}
+  FR-2 &
+  The system shall validate a scenario before starting the simulation,
+  rejecting topologically inconsistent configurations (e.g., dangling
+  cables,
+  references to non-existent entities, disconnected graphs). &
+  Given an invalid scenario, simulation creation is refused and a
+  descriptive
+  validation error is returned instead of starting. \\
 
-  \item If there are domain-specific terms, these should be explained in a glossary
-  
-  \item Each requirement must have its own \textbf{acceptance criterion}
-  %
-  \begin{itemize}
-    \item these will be important for the validation phase
-  \end{itemize}
-\end{itemize}
+  FR-3 &
+  The system shall evolve the simulation through discrete, user-configurable
+  time steps (``ticks''), updating environment (time of day, irradiance,
+  temperature) at every tick. &
+  After $n$ ticks of duration $d$, the simulated time of day has advanced by
+  exactly $n \times d$. \\
 
-\subsection{Relevant Distributed System Features}
-\label{ds-features}
+  FR-4 &
+  Each house shall resolve its internal energy balance (local consumption
+  vs.\
+  local solar production vs.\ local battery charge/discharge) before
+  exchanging any residual surplus/deficit with the micro-grid. &
+  For a house with production $\geq$ consumption and available battery
+  headroom, no energy is exchanged with the grid until the battery is full.
+  \\
 
-Motivate which distributed system features are relevant for your project, and which are not.
-%
-\begin{itemize}
-  \item transparency
-  \begin{itemize}
-    \item does your system need to hide distribution details from users or developers?
-    \item is it important that failures, location, or replication are invisible?
-  \end{itemize}
+  FR-5 &
+  Each solar panel shall compute its generated power as a function of
+  irradiance, surface, and efficiency. &
+  Given fixed irradiance and efficiency, generated power scales linearly
+  with
+  surface area, matching the reference formula. \\
 
-  \item fault tolerance, dependability -- availability, reliability, integrity, maintainability, safety
-  \begin{itemize}
-    \item what happens if a component fails? is uninterrupted service required?
-    \item is data loss or corruption unacceptable?
-    \item how quickly must the system recover from faults?
-  \end{itemize}
+  FR-6 &
+  Each battery storage shall accumulate surplus energy and release stored
+  energy to cover deficits, respecting maximum capacity, maximum
+  charge/discharge power, and a minimum state-of-charge (SoC) threshold. &
+  The battery never reports SoC outside $[\text{minSoC},
+  \text{maxCapacity}]$,
+  nor a charge/discharge rate above its configured limit, across any
+  sequence
+  of ticks. \\
 
-  \item scalability
-  \begin{itemize}
-    \item will the system need to handle increasing numbers of users, requests, or data?
-    \item is it expected to grow over time?
-  \end{itemize}
+  FR-7 &
+  The system shall resolve the global energy balance of the micro-grid and
+  compute the resulting power flow on every cable through a dedicated
+  algorithm. &
+  For a closed network with known injections/withdrawals, the computed cable
+  flows satisfy Kirchhoff's current law at every node within numerical
+  tolerance. \\
 
-  \item security, trust
-  \begin{itemize}
-    \item is sensitive data being processed or stored?
-    \item are there multiple user roles with different permissions?
-    \item is authentication or authorization required?
-  \end{itemize}
+  FR-8 &
+  Any energy surplus/deficit not absorbed internally by the micro-grid shall
+   be
+  settled with the External Grid, modeled as an infinite source/sink. &
+  After a tick, the sum of all internal flows plus the External Grid
+  exchange
+  equals zero (energy conservation). \\
 
-  \item resource sharing
-  \begin{itemize}
-    \item do multiple users or components need access to shared resources?
-    \item is coordination or synchronization needed?
-  \end{itemize}
+  FR-9 &
+  The system shall persist every intermediate simulation state immutably,
+  enabling later reconstruction of the full history of a run. &
+  After $n$ ticks, the state at any tick $k \leq n$ can be retrieved or
+  reconstructed unchanged, even after a process restart. \\
 
-  \item openness, interoperability, heterogeneity of components
-  \begin{itemize}
-    \item Will your system interact with external systems or use components built with different technologies?
-    \item Is standardization or compatibility important?
-  \end{itemize}
+  FR-10 &
+  The user shall be able to visualize the micro-grid as a real-time,
+  interactive graph, with cables in
+  overload highlighted. &
+  A cable whose instantaneous flow exceeds its maximum capacity is rendered
+  in
+  a visually distinct color within one GUI refresh cycle. \\
 
-  \item evolvability, maintainability
-  \begin{itemize}
-    \item Will the system need to be updated or extended after deployment?
-    \item Is long-term maintenance a concern?
-  \end{itemize}
+  FR-11 &
+  The user shall be able to inspect the detailed state of a selected node or
+  cable (battery SoC/limits, panel irradiance/production, house net balance,
+  cable flow/capacity). &
+  Selecting any graph element updates a detail panel with values matching
+  the
+  current backend state for that element. \\
 
-  \item performance, concurrency, computation / communication efficiency, bandwidth
-  \begin{itemize}
-    \item Are there strict requirements on response time or throughput?
-    \item Will many operations happen in parallel?
-    \item Is network usage a concern?
-  \end{itemize}
+  FR-12 &
+  The user shall be able to control the simulation lifecycle (start, pause,
+  single-step) through the GUI. &
+  Issuing start/pause/step produces the corresponding state transition
+  (Running/Paused/advanced-by-one-tick) visible in the GUI within a bounded
+  time. \\
 
-  \item economy, costs  
-  \begin{itemize}
-    \item Are there budget constraints for development, deployment, or operation?
-    \item Is minimizing resource usage important?
-  \end{itemize}
-\end{itemize}
+  FR-13 &
+  The system shall expose simulation lifecycle control (create, start,
+  pause,
+  step, delete, query status) through a network-accessible HTTP API,
+  independent of the GUI process. &
+  An HTTP client with no GUI can create and fully control a simulation using
+  only documented REST endpoints. \\
+
+  FR-14 &
+  The system shall publish per-tick simulation and entity snapshots on a
+  distributed message stream (Kafka), so that GUI clients can observe
+  simulation evolution without querying backend actors directly. &
+  A Kafka consumer subscribed to the simulation's topic receives one
+  snapshot
+  message per completed tick, in tick order. \\
+
+  FR-15 &
+  The backend shall support multiple, independently addressable concurrent
+  simulations. &
+  Two simulations created with different identifiers can be started,
+  stepped,
+  and paused independently without one affecting the other's state. \\
+
+  \caption{Functional requirements.}
+  \label{tab:functional-requirements}
+  \end{longtable}
+
+  \section{Non-Functional Requirements}
+  \label{sec:non-functional-requirements}
+
+
+  \begin{longtable}{@{}p{1.5cm} p{6.3cm} p{6.3cm}@{}}
+  \toprule
+  \textbf{ID} & \textbf{Requirement} & \textbf{Acceptance criterion} \\
+  \midrule
+  \endfirsthead
+  \toprule
+  \textbf{ID} & \textbf{Requirement} & \textbf{Acceptance criterion} \\
+  \midrule
+  \endhead
+  \bottomrule
+  \endfoot
+
+  NFR-1 &
+  Simulation state shall be fully immutable, and tick transitions shall be
+  expressed as pure functions (no hidden side effects on domain state). &
+  The domain model (\texttt{SimulationState}, entity states) exposes no
+  mutators; the same $(\text{state}, \text{model}, \Delta t)$ input always
+  yields the same next state. \\
+
+  NFR-2 &
+  The GUI shall remain responsive regardless of tick computation cost, by
+  delegating simulation computation to background execution. &
+  During continuous ticking, GUI event handling (mouse/keyboard, panel
+  selection) is never blocked for the duration of a tick computation. \\
+
+  NFR-3 &
+  The system shall be resilient to individual component failures: an actor
+  crash shall not corrupt or silently lose already-persisted simulation
+  history. &
+  After a forced crash and restart of a simulation/entity actor, the
+  recovered
+  state matches the last successfully persisted event/snapshot (verified by
+  the project's crash-test suite). \\
+
+  NFR-4 &
+  The architecture shall be modular and extensible, allowing new entity
+  types,
+  consumption/storage strategies, or power-flow algorithms to be added
+  without
+  modifying the simulation engine. &
+  A new entity evolution strategy can be registered via the existing
+  type-class/strategy extension points without editing
+  \texttt{DefaultSimulationEngine}. \\
+
+  NFR-5 &
+  The application shall be portable across operating systems supporting a
+  JVM. &
+  The same build artifact runs unmodified on Windows, Linux, and macOS JVMs.
+   \\
+
+  NFR-6 &
+  The backend shall be horizontally scalable with respect to the number of
+  simulated entities, by distributing entity computation across cluster
+  nodes/shards. &
+  Adding a cluster node increases the number of shard regions actively
+  hosting
+  entities, without requiring changes to simulation logic. \\
+
+  \caption{Non-functional requirements.}
+  \label{tab:non-functional-requirements}
+  \end{longtable}
+
+  \section{Implementation Requirements}
+  \label{sec:implementation-requirements}
+
+  \begin{longtable}{@{}p{1.2cm} p{6.0cm} p{6.9cm}@{}}
+  \toprule
+  \textbf{ID} & \textbf{Requirement} & \textbf{Justification} \\
+  \midrule
+  \endfirsthead
+  \toprule
+  \textbf{ID} & \textbf{Requirement} & \textbf{Justification} \\
+  \midrule
+  \endhead
+  \bottomrule
+  \endfoot
+
+  IR-1 &
+  The system shall be developed in Scala~3 (3.3.7) on JDK~21. &
+  Chosen for strong support of algebraic data types, pattern matching, and
+  context parameters, which fit the functional-core design; consistent
+  toolchain across the team. \\
+
+  IR-2 &
+  Gradle with Kotlin DSL shall be used for build and multi-module
+  management. &
+  Supports the multi-module layout (\texttt{app}, \texttt{protocols}) and is
+  the team's agreed build tool. \\
+
+  IR-3 &
+  Cats shall be used for functional constructs (State monad, type classes,
+  Functor/Applicative); heavier effect frameworks (Cats Effect, ZIO) are
+  explicitly excluded. &
+  Keeps the functional core lightweight; asynchronous/effectful code is
+  delegated to Scala standard constructs and the actor runtime instead of a
+  second effect system. \\
+
+  IR-4 &
+  JavaFX/ScalaFX shall be used for the GUI. &
+  JVM-native, matches the chosen language/runtime, avoids introducing a
+  separate web front-end stack. \\
+
+  IR-5 &
+  Apache Pekko shall be used for the distributed runtime (typed actors,
+  cluster, cluster sharding, persistence, HTTP). &
+  Provides location-transparent actors, sharding, and event sourcing out of
+  the box, directly satisfying FR-15/NFR-3/NFR-6 without building a custom
+  distribution layer. \\
+
+  IR-6 &
+  Apache Kafka shall be used as the telemetry transport between backend and
+  GUI/analytics clients. &
+  Decouples producers (simulation ticks) from an arbitrary number of
+  consumers (FR-14), with built-in buffering/replay semantics. \\
+
+  IR-7 &
+  ScalaTest (with Pekko TestKit) and JUnit shall be used for unit, actor,
+  and
+  integration testing. &
+  Matches the actor-based backend (via \texttt{ScalaTestWithActorTestKit},
+  \texttt{EventSourcedBehaviorTestKit}) and the team's TDD workflow
+  described
+  in the testing chapter. \\
+
+  \caption{Implementation requirements.}
+  \label{tab:implementation-requirements}
+  \end{longtable}
+
+  \section{Glossary}
+  \label{sec:glossary}
+
+  \begin{description}
+    \item[Micro-grid] A local electrical network modeled as a graph of
+  energy
+      entities connected by cables.
+    \item[Tick] A discrete simulation time step, of user-configured
+  duration,
+      at which the system recomputes environment and entity states.
+    \item[Entity] A node of the micro-grid graph: House, SolarPanel,
+  Storage,
+      or External Grid.
+    \item[House] An entity combining a consumption profile with optional
+  local
+      production (SolarPanel) and storage (battery).
+    \item[SolarPanel] A production entity whose output depends on
+  irradiance,
+      surface, and efficiency.
+    \item[Storage / Battery] An accumulation entity bounded by maximum
+      capacity, maximum charge/discharge power, and a minimum
+  state-of-charge
+      threshold.
+    \item[Cable] An edge of the micro-grid graph, with a maximum
+      power-transport capacity.
+    \item[External Grid] A special node acting as an infinite energy
+      source/sink, absorbing or providing any residual imbalance.
+    \item[SoC (State of Charge)] The current stored energy level of a
+  battery,
+      relative to its capacity.
+    \item[Power flow] The distribution of power across cables resulting from
+      nodal energy balances.
+    \item[DSL (Domain Specific Language)] The embedded Scala language used
+  to
+      declaratively describe a scenario.
+    \item[SimulationActor] The actor orchestrating the tick cycle of one
+      simulation instance.
+    \item[EntityActor] A sharded actor owning the evolution of one grid
+      entity.
+    \item[Cluster sharding] The Pekko mechanism distributing actor instances
+      (e.g., EntityActors) across cluster nodes.
+    \item[Event sourcing] Persistence pattern storing state changes as an
+      append-only sequence of events rather than mutable records.
+    \item[Snapshot] A periodic, consolidated copy of an actor's state used
+  to
+      bound recovery time.
+    \item[Telemetry] The stream of per-tick simulation/entity snapshots
+      published to Kafka for external consumption.
+  \end{description}
+
+  \section{Relevant Distributed System Features}
+  \label{sec:distributed-features}
+
+  GridSim is split into a backend simulation engine and a GUI client precisely because specific
+  distributed-system properties are needed. This section motivates, feature
+  by feature, which properties matter for the project and which are explicitly
+  out of scope.
+
+  \begin{description}
+
+  \item[Transparency --- relevant (location transparency), not relevant
+    (hiding failures from the user).]
+  Cluster sharding gives \emph{location transparency} for entities: a
+  \texttt{SimulationActor} addresses an \texttt{EntityActor} by logical id
+  (\texttt{simulationId-localId}) without knowing which physical node
+  currently hosts it, and the shard can be rebalanced across nodes without
+  changing calling code. This is actively used, since entity placement is
+  meant to scale with grid size. Conversely, \emph{full} transparency toward
+  the human user (hiding every failure or delay) is \textbf{not} a goal: the
+  GUI is intended to surface a ``disconnected/degraded'' state when the
+  backend or Kafka is unreachable,
+  rather
+  than hide it --- operators need to know when they are looking at stale
+  data.
+
+  \item[Fault tolerance / dependability --- highly relevant.]
+  The simulation represents potentially long-running,
+  non-trivial-to-recompute
+  state, so uninterrupted service and no silent data loss are explicit
+  goals:
+  state changes are event-sourced, periodic snapshots bound recovery time,
+  and
+  both \texttt{SimulationActor} and \texttt{EntityActor} use a
+  restart-with-backoff supervision strategy with automatic recovery
+  (\texttt{RecoveryCompleted} re-arming the tick timer). \textbf{Availability under
+  partial failure is a known weak point, explicitly tracked and being closed.}
+  This makes dependability one of the two primary distribution drivers for the project.
+
+  \item[Scalability --- relevant.]
+  The system is designed to scale with the \emph{size of the simulated grid}
+  (number of entities), not with number of end users: cluster sharding
+  allows
+  entity computation to be spread across nodes as a scenario grows, and
+  multiple independent simulations can coexist (tracked by the
+  \texttt{SimulationRegistryActor}). Scaling to many concurrent \emph{human
+  users/tenants} is not a design goal --- GridSim remains an
+  engineering/educational tool used by a small number of operators per
+  deployment.
+
+  \item[Security, trust --- not a primary concern.]
+  There is no end-user authentication/authorization model, no multiple
+  permission levels, and no sensitive personal data; the ``data'' being
+  protected is simulation state, not user secrets. Given the
+  academic/experimental scope and the absence of a multi-tenant security
+  boundary, this dimension is explicitly \textbf{out of scope} for the
+  current
+  requirements.
+
+  \item[Resource sharing --- relevant.]
+  Decoupling the engine from the GUI via HTTP (control) and Kafka
+  (telemetry)
+  exists precisely so that the simulation process
+  can
+  be hosted once and shared: several GUI clients can observe the same
+  running
+  simulation, and one backend can run several simulations concurrently. This
+  is the second primary distribution driver, alongside fault tolerance.
+
+  \item[Openness, interoperability, heterogeneity --- moderately relevant.]
+  The backend exposes a plain HTTP REST API and plain Kafka topics rather
+  than
+  a proprietary, actor-only protocol; this means any HTTP client or Kafka
+  consumer, not necessarily built in Scala/Pekko, can control a simulation
+  or
+  read its telemetry.
+
+  \item[Evolvability, maintainability --- relevant]
+  The Functional Core/Imperative Shell and Observer-based dispatch patterns
+  keep the simulation engine, statistics, and GUI independently evolvable.
+  This requirement is satisfied largely through modular design rather than
+  through distribution mechanisms per se, though the explicit HTTP/Kafka
+  contracts also reduce coupling between backend and client releases.
+
+  \item[Performance, concurrency, computation/communication efficiency ---
+    relevant.]
+  Per-tick computation is intentionally parallelized across
+  \texttt{EntityActor}s rather than computed in a single sequential loop,
+  which is a direct efficiency/concurrency motivation for using an
+  actor-based, shardable runtime. Network usage (Kafka telemetry volume,
+  HTTP
+  control latency) matters insofar as it must not interfere with real-time
+  GUI updates; efficiency is a secondary
+  requirement rather than a hard constraint.
+
+  \item[Economy, costs --- minor relevance.]
+  As an academic project, there is no production budget to optimize against;
+  however, the choice of exclusively open-source technologies and an in-memory/local persistence backend for development reflects a general intent to minimize infrastructure cost and setup
+  complexity rather than an explicit budget constraint.
+
+\end{description}
 
 \section{Design}\label{design}
 
