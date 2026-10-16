@@ -87,40 +87,104 @@ This is intended: it is the \LaTeX{} way to separate capoverses.
 
 \section{Concept}\label{concept}
 
-Here you should explain:
+\subsection{Type of product}
+
+GridSim is a distributed desktop application for energy micro-grid simulation, composed of
+a backend simulation engine and a graphical client, which can be deployed either as a
+single co-located process or as two independent, network-connected components.
+
+More precisely, the product is a hybrid of two of the categories listed above:
+\begin{itemize}
+    \item A \textbf{desktop application} with a graphical user interface (GUI), built with ScalaFX,
+  through which the user creates micro-grid scenarios, starts/pauses/steps the simulation,
+  and visualizes its evolution as an interactive, real-time graph (nodes = energy entities,
+  edges = cables), together with dashboards and per-element detail panels (battery state of
+  charge, solar panel irradiance, instantaneous power flow on a cable, etc.).
+  \item A \textbf{backend service}, built on top of an actor system (Apache Pekko), that
+  hosts the actual simulation engine, exposes an HTTP REST API to create/control simulations
+  remotely, and publishes simulation telemetry on Apache Kafka topics so that one or more GUI
+  clients can subscribe to the live state of a simulation without being co-located with the
+  engine that computes it.
+\end{itemize}
+
+The two parts can run together in a single JVM process (local mode) or be split across different machines/processes
+(distributed mode): a headless backend node (or cluster of nodes) running the simulation,
+and one or more GUI clients connecting remotely via HTTP (control plane) and Kafka (data
+plane). A Launcher component selects at startup which configuration to run (embedded,
+backend-only, or remote GUI).
+
+In addition to the interactive product, the project also provides a small embedded Domain
+Specific Language (DSL), written in Scala, used to declaratively describe a micro-grid
+scenario (houses, solar panels, batteries, cables, external grid, weather profile).
+
+\subsection{Use case}
+
+GridSim models a local energy micro-grid as a directed graph: nodes are energy entities
+(houses, standalone solar panels, battery storages, and a single "External Grid" node
+acting as an infinite source/sink), and edges are cables with a maximum power-transport
+capacity. The simulation advances in discrete time steps ("ticks"); at every tick the
+environment is updated, each entity resolves
+its local energy balance (e.g., a house nets its consumption against its own solar
+production and battery), and the residual surplus/deficit is routed through the micro-grid
+topology using a power-flow algorithm, ultimately settling any
+unbalanced energy with the External Grid. All intermediate states are kept immutable, so
+the full history of a simulation run can be reconstructed and analyzed.
+
+Users are not necessarily co-located with the machine running the simulation. The
+simulation engine can run on a dedicated backend (e.g., a lab/cluster machine or a cloud VM
+with more memory/CPU than a laptop), while the user interacts with it from a separate
+desktop GUI, potentially from a different machine on the same network. This is a deliberate decoupling: the entity that computes the micro-grid is independent from the entity that observes/controls it.
+
+Interaction happens in two distinct patterns always through the desktop GUI:
+\begin{itemize}
+    \item \textbf{Configuration phase} (low frequency, interactive): the user defines a scenario through the
+    DSL/GUI — topology, components, weather, tick duration — before the simulation starts.
+    This happens once per scenario, or occasionally during authoring/debugging of a scenario.
+    \item \textbf{Monitoring/control phase} (continuous, real-time): once running, the system streams a new
+    state snapshot at every tick; a user watching the GUI dashboard receives updates at the
+    configured tick rate (potentially several times per second), observing the evolving graph,
+    energy flows, and statistics, and can at any time issue start/pause/step commands. This is
+    a long-lived, continuous interaction, not a one-shot request/response.
+\end{itemize}
+
+In this project, data is closer to "simulation state" than classic personal user data:
+\begin{itemize}
+    \item  \textbf{Scenario configuration} — authored/held client-side until a simulation is created on the backend.
+    \item \textbf{Simulation state}, modeled as two parts: an immutable static model (topology, entity
+    specifications) and dynamic state (environment, battery charge, flows), held by the backend actors.
+    \item \textbf{Event history}: every state transition is persisted as an event (event sourcing) in a
+    persistence journal, plus periodic snapshots, enabling crash recovery and historical
+    reconstruction of a run.
+    \item \textbf{Telemetry stream}: per-tick snapshots are also published to Kafka topics so that GUI
+    clients (and, potentially, external analytics consumers) can observe simulation evolution
+    without querying the backend state directly.
+\end{itemize}
+
+\subsection{Distribution motivations}
+
+Distribution in GridSim is motivated by a combination of factors; the dominant ones are
+resource sharing/separation of concerns and fault tolerance, with computation parallelism
+and geographic distribution as secondary but still relevant drivers.
 
 \begin{itemize}
-  \item The type of product developed with that project, for example (non-exhaustive):
-  %
-  \begin{itemize}
-    \item Application (with GUI, be it mobile, web, or desktop)
-    \item Command-line application (CLI could be used by humans or scripts)
-    \item Library
-    \item Web-service(s)
-  \end{itemize}
-
-  \item Use case description:
-  %
-  \begin{itemize}
-    \item \emph{what} is the software doing?
-    \item \emph{where} are the users?
-    \item \emph{when} and \emph{how frequently} do they interact with the system?
-    \item \emph{how} do they \emph{interact} with the system? which \emph{devices} are they using?
-    \item does the system need to \emph{store} user's \textbf{data}? \emph{which}? \emph{where}?
-    \item most likely, there will be \emph{multiple} \textbf{roles}
-  \end{itemize}
-
-  \item Why is distribution needed?
-  %
-  \begin{itemize}
-    \item geographically distributed environments?
-    \item computation speedup?
-    \item resource sharing?
-    \item fault tolerance?
-    \item other reasons?
-  \end{itemize}
-  %
-  In any case, please elaborate.
+    \item \textbf{Resource sharing and separation of concerns}. The simulation engine and the GUI have very
+    different resource profiles and lifecycles: the engine is CPU/state-heavy and must run
+    continuously and deterministically tick after tick, while the GUI is interaction-heavy and
+    must stay responsive regardless of how expensive a tick computation is. By decoupling them
+    (HTTP for control, Kafka for streaming telemetry), several GUI instances can observe the
+    same backend simulation concurrently, a single backend can host multiple concurrent
+    simulations, and a user is never forced to run the heavy simulation process on their own desktop, it can be hosted on a shared, more capable machine.
+    \item \textbf{Computation speedup / parallelism}. A micro-grid is naturally decomposable: each entity
+    (house, panel, storage) evolves largely independently within a tick, subject to the
+    topology constraints resolved afterwards by the power-flow solver. This maps directly onto
+    Pekko's cluster sharding: entities are distributed across (potentially many) shard regions
+    and evolved concurrently, rather than sequentially in a single-threaded loop. This allows
+    larger micro-grids (more entities) to be simulated and allows horizontal scaling by adding more
+    backend nodes to the cluster as the simulated grid grows.
+    \item \textbf{Fault tolerance}. Because the simulation state is valuable and the system is meant to run continuously, the architecture uses event sourcing (every state transition persisted as an event) plus periodic snapshotting, together with actor supervision strategies and automatic recovery on restart. This means an Entity or Simulation crash does not lose simulation history and the system can resume from the
+    last known consistent state rather than failing the whole simulation.
+    \item  \textbf{Geographic/organizational distribution}. the HTTP+Kafka boundary between GUI and backend is designed precisely so that a GUI client can be run anywhere with network access to the backend's exposed endpoints, which is relevant for scenarios such as a shared simulation server observed by multiple
+    analysts from different workstations.
 \end{itemize}
 
 \section{Requirements Elicitation and Analysis}\label{requirements}
