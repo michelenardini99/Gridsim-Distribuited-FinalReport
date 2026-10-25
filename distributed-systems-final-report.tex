@@ -4,30 +4,30 @@
 \usepackage{url}
 \usepackage{natbib}
 \usepackage{graphicx}
+\usepackage{float}
 \usepackage{longtable}                                                    
 \usepackage{array}
 \usepackage{booktabs}
 \usepackage[table]{xcolor}
+\usepackage{tikz}
+\usepackage{amsmath}
+\usetikzlibrary{arrows.meta, fit, backgrounds, shapes.multipart}
+\usepackage{adjustbox}
+\usetikzlibrary{positioning}
 \usepackage{cleveref} % this must be the last package to be loaded
+
 
 \newcommand{\emailaddr}[1]{\href{mailto:#1}{\texttt{#1}}}
 
 \title{\LARGE
-    Final Report Template\\
-    (replace with your project name)
+    Final Report GridSim
 }
-\subtitle{Final Report for the Distributed Systems Course [Your academic year here]}
-
-% Consider watching:
-% https://www.youtube.com/watch?v=ihxSUsJB_14
-% https://www.youtube.com/watch?v=XTFWaV55uDo
+\subtitle{Final Report for the Distributed Systems Course 2025/2026}
 
 \author{
-    Author 1 \\ \emailaddr{author1@email.it}
+    Author 1 \\ \emailaddr{matteo.bambini@studio.unibo.it}
     \and
-    Author 2 \\ \emailaddr{author2@gmail.com}
-    \and
-    Author 3 \\ \emailaddr{author3@unibo.it}
+    Author 2 \\ \emailaddr{michele.nardini2@studio.unibo.it}
 }
 
 \date{\today}
@@ -37,7 +37,24 @@
 \maketitle
 
 \begin{abstract}
-    Up to $\sim$2000 characters briefly describing the project.
+GridSim-Distribuited simulates a small electrical grid --- houses, solar panels, batteries and
+the cables connecting them --- as a genuinely distributed, tick-driven system rather than as a
+single-process program. On the backend, every grid entity and every running simulation is an
+independent, event-sourced Apache Pekko actor: cluster sharding gives each one a stable identity
+regardless of which node currently hosts it, and Pekko Persistence lets it recover its exact state
+after a restart by replaying its event log. Each simulated tick is a scatter/gather exchange
+between a simulation's orchestrating actor and its entities, guarded by a timeout; a timed-out
+tick is retried with exponential backoff, the retry is idempotent with respect to the
+at-least-once delivery a distributed system has to assume, and a run of repeated failures is
+reported to clients as a degraded status rather than silently retried forever. A Split Brain
+Resolver, configured with a keep-majority strategy, gives the cluster a deterministic response to
+a network partition. A separate ScalaFX desktop client, structured with an MVVM architecture,
+drives the simulation's lifecycle through a synchronous HTTP API and observes its progress through
+Protobuf-encoded telemetry published over Apache Kafka, a channel that lets several GUI instances
+watch the same simulation at once without the backend tracking who is listening. Grid topologies
+are authored through a small internal Scala DSL with accumulating validation, from which the
+system's four built-in scenario presets are built. This report documents the requirements,
+architecture, implementation and validation of the system.
 \end{abstract}
 
 \chapter{Concept}\label{concept}
@@ -578,316 +595,698 @@ and geographic distribution as secondary but still relevant drivers.
 
 \section{Design}\label{design}
 
-This chapter explains the strategies used to meet the requirements identified in the analysis. 
-%
-Ideally, the design should be the same, regardless of the technological choices made during the implementation phase.
-
-\begin{quote}
-You can re-arrange the sections as you prefer, but all the sections must be present in the end
-\end{quote}
-
-\noindent
-\textbf{Important:} try to motivate your design choices in relation to the requirements and features identified 
-in \cref{requirements} and \cref{ds-features}.
 
 \subsection{Architecture}\label{architecture}
 
+GridSim adopts a \textbf{client--server architectural style} in which the server itself is an
+internally distributed, actor-based system: the backend (one or more Apache Pekko cluster
+nodes) hosts the simulation engine behind a stable logical address space, while an arbitrary
+number of GUI clients connect to it over the network. Three complementary patterns refine this
+top-level style:
+
 \begin{itemize}
-  \item Which architectural style?
-  %
-  \begin{itemize}
-    \item why?
-  \end{itemize}
+  \item \textbf{Actor model with cluster sharding} for the backend itself. Each simulation
+  and each grid entity is modeled as an independent, uniquely addressable, stateful actor
+  (\texttt{SimulationActor}, \texttt{EntityActor}). This directly serves \textsc{FR-15} (multiple independent
+  concurrent simulations) and \textsc{NFR-6} (horizontal scalability with the number of
+  entities): entities evolve concurrently and are transparently distributed/rebalanced across
+  cluster nodes by Pekko's cluster sharding, with no change to application logic as the
+  cluster grows. This choice is a direct consequence of the \emph{computation
+  parallelism} and \emph{scalability} distribution motivations discussed in
+  \cref{sec:distributed-features}.
+  \item \textbf{Separate control and data planes} between client and server: a synchronous
+  HTTP REST API (Pekko HTTP) is used for low-frequency lifecycle commands and queries
+  (\textsc{FR-12}, \textsc{FR-13}), while an asynchronous Kafka publish/subscribe channel
+  carries the high-frequency, continuous telemetry stream (\textsc{FR-14}). Splitting these
+  two very different interaction shapes into two different transports/protocols, instead of
+  multiplexing both onto a single connection, keeps each plane simple and lets any number of
+  GUI instances (or non-GUI consumers) subscribe to the data plane independently from who
+  issues control commands --- directly serving the \emph{resource sharing} motivation.
+  \item \textbf{Functional core, imperative shell} inside each simulation. The actual tick
+  transition ($S_{t+1} = \mathit{step}(S_t)$: environment advance, per-entity evolution,
+  power-flow resolution) is implemented as pure, side-effect-free functions over immutable
+  data (\textsc{NFR-1}); the surrounding actor (\texttt{SimulationActor}) is the only
+  component allowed to perform effects (scheduling, persistence, publishing). This keeps the
+  domain logic deterministic and trivially unit-testable in isolation from the distributed
+  runtime, while confining all actor-related complexity (timeouts, retries, recovery, see
+  \cref{fault-tolerance}) to a thin imperative layer.
 \end{itemize}
+
+On the client side, the GUI is a passive, stateles observer
+(\cref{behaviour}): it never holds authoritative simulation state, only a reactive projection
+of what the backend publishes, which satisfies \textsc{NFR-2} (the UI thread is never blocked
+by tick computation, since computation happens entirely on the backend and the UI only reacts
+to asynchronous messages).
 
 \subsection{Infrastructure}\label{infrastructure}
 
+Four infrastructural component \emph{kinds} appear in the design:
+
 \begin{itemize}
-  \item are there \emph{infrastructural components} that need to be introduced? \emph{how many}?
-  %
-  \begin{itemize}
-    \item e.g.~\emph{clients}, \emph{servers}, \emph{load balancers},
-    \emph{caches}, \emph{databases}, \emph{message brokers},
-    \emph{queues}, \emph{workers}, \emph{proxies}, \emph{firewalls},
-    \emph{CDNs}, \emph{etc.}
-  \end{itemize}
-
-  \item how do components \emph{distribute} over the network? \emph{where}?
-  %
-  \begin{itemize}
-    \item e.g.~do servers / brokers / databases / etc. sit on the same
-    machine? on the same network? on the same datacenter? on the same
-    continent?
-  \end{itemize}
-
-  \item how do components \emph{find} each other?
-  %
-  \begin{itemize}
-    \item how to \emph{name} components?
-    \item e.g.~DNS, \emph{service discovery}, \emph{load balancing},
-    \emph{etc.}
-  \end{itemize}
+  \item \textbf{Backend node(s)}: one or more Apache Pekko \texttt{ActorSystem} processes
+  (\texttt{GridSimAgentSystem}) forming a single cluster. Each node hosts shard regions for
+  \texttt{EntityActor} and \texttt{SimulationActor}, so adding nodes increases the number of
+  shard regions available to host entities (\textsc{NFR-6}).
+  \item \textbf{HTTP API endpoint}: a Pekko HTTP server bound on every backend node
+  (port \texttt{8080}) exposing \texttt{SimulationControlRoutes}, the control plane for
+  \textsc{FR-12}/\textsc{FR-13}.
+  \item \textbf{Message broker}: a single Apache Kafka broker acting as the data plane,
+  carrying three logical topic families per simulation, satisfying \textsc{FR-14}.
+  \item \textbf{GUI client(s)}: one or more ScalaFX desktop processes, each independently subscribing to the data plane and issuing control-plane
+  calls.
 \end{itemize}
 
-\begin{quote}
-Component diagrams are welcome here
-\end{quote}
+\textbf{Network placement.} Backend node(s) and the Kafka broker are expected to sit on the same
+machine, while GUI clients may run on a \emph{different} host on
+that same network.. A \texttt{Launcher} entry point selects at startup
+whether a given process runs as \texttt{backend} (headless actor system + HTTP + Kafka
+producer) or as \texttt{gui} (ScalaFX client), or both together in a single JVM for local,
+single-machine use.
+
+\textbf{Discovery/naming.} Two different, deliberately simple naming mechanisms are used,
+reflecting the project's static, small-scale deployment scope rather than a dynamic/elastic
+one:
+\begin{itemize}
+  \item \emph{Inside} the backend cluster, nodes locate each other via a statically
+  configured seed-node list (\texttt{pekko.cluster.seed-nodes}); once joined, \emph{entities} are
+  addressed by stable logical identifiers (\texttt{simulationId} for a
+  \texttt{SimulationActor}, \texttt{simulationId-localId} for an \texttt{EntityActor}) that
+  cluster sharding resolves to a physical node transparently, giving \emph{location
+  transparency} as already motivated in \cref{sec:distributed-features}.
+  \item \emph{Between} client and server, there is no discovery layer at all: the GUI is
+  pointed directly at the backend's HTTP and Kafka endpoints via CLI arguments
+  (\texttt{--api}, \texttt{--kafka}, defaulting to \texttt{localhost}), which is an accepted
+  simplification given the single-backend, operator-driven deployment model;
+\end{itemize}
+
+\cref{fig:infrastructure-components} summarizes the components discussed above.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  font=\small,
+  >=Stealth,
+  thick,
+  comp/.style={draw, rounded corners, align=center, minimum width=34mm, minimum height=10mm,
+    fill=blue!6, inner sep=4pt},
+  shard/.style={draw, rounded corners, align=center, minimum width=28mm, minimum height=8mm,
+    fill=orange!10, inner sep=3pt},
+  broker/.style={draw, rounded corners, align=center, minimum width=36mm, minimum height=14mm,
+    fill=green!8, inner sep=4pt},
+  client/.style={draw, rounded corners, align=center, minimum width=34mm, minimum height=10mm,
+    fill=gray!10, inner sep=4pt},
+  grp/.style={draw, dashed, rounded corners, inner sep=6pt},
+  netgrp/.style={draw, dash dot, rounded corners, inner sep=14pt},
+]
+
+  % GUI client(s) -- two stacked rectangles suggest "0..N instances"
+  \node[client] (guiBack) at (0, 7.3) {};
+  \node[client] (gui) at (0.3, 7.6) {GUI};
+
+  % Control plane endpoint
+  \node[comp] (http) at (-4.5, 3.6) {HTTP API};
+
+  % Data plane broker
+  \node[broker] (kafka) at (4.5, 3.6)
+    {Kafka Broker};
+
+  % Backend cluster node 1
+  \node[comp] (as1) at (-4.5, 0) {ActorSystem\\\footnotesize\texttt{GridSimAgentSystem} (Node 1)};
+  \node[shard] (ent1) at (-6, -1.9) {EntityActor\\\footnotesize shard region};
+  \node[shard] (sim1) at (-3, -1.9) {SimulationActor\\\footnotesize shard region};
+
+  % Backend cluster node 2
+  \node[comp] (as2) at (4.5, 0) {ActorSystem\\\footnotesize\texttt{GridSimAgentSystem} (Node 2)};
+  \node[shard] (ent2) at (3, -1.9) {EntityActor\\\footnotesize shard region};
+  \node[shard] (sim2) at (6, -1.9) {SimulationActor\\\footnotesize shard region};
+
+  \begin{pgfonlayer}{background}
+    \node[grp, fit=(as1)(ent1)(sim1), label={[font=\small]above:Node 1}] (node1) {};
+    \node[grp, fit=(as2)(ent2)(sim2), label={[font=\small]above:Node 2}] (node2) {};
+  \end{pgfonlayer}
+
+  % Control plane
+  \draw[<->] (gui) -- (http)
+    node[midway, above, sloped, font=\footnotesize] {REST/JSON};
+  \draw[->] (http) -- (node1) node[midway, left, font=\footnotesize] {route via \texttt{EntityRef}};
+  \draw[->] (http) -- (node2);
+
+  % Cluster membership
+  \draw[<->, dashed] (node1) -- (node2)
+    node[midway, below, font=\footnotesize] {seed-nodes};
+
+  % Data plane
+  \draw[->] (node1) -- (kafka) node[midway, below, font=\footnotesize] {publish)};
+  \draw[->] (node2) -- (kafka);
+  \draw[->] (kafka) to[bend left=12]
+    node[midway, right, font=\footnotesize] {subscribe} (gui);
+
+\end{tikzpicture}
+\caption{Infrastructural components of GridSim and their placement. A GUI client reaches the
+backend cluster's HTTP API for lifecycle commands/queries (control plane) and the Kafka broker
+for telemetry (data plane); cluster sharding routes each HTTP call to whichever node currently
+owns the targeted \texttt{SimulationActor}/\texttt{EntityActor}. Backend nodes and the broker
+are expected to share a trusted network, while GUI clients may be remote.}
+\label{fig:infrastructure-components}
+\end{figure}
 
 \subsection{Modelling}\label{modelling}
 
-\begin{itemize}
-  \item which \textbf{domain entities} are there?
-  %
-  \begin{itemize}
-    \item e.g.~\emph{users}, \emph{products}, \emph{orders}, \emph{etc.}
-  \end{itemize}
-  
-  \item how do \emph{domain entities} \textbf{map to} \emph{infrastructural components}?
-  %
-  \begin{itemize}
-    \item e.g.~state of a video game on central server, while inputs/representations on clients
-    \item e.g.~where to store messages in an IM app? for how long?
-  \end{itemize}
+\textbf{Domain entities.} The micro-grid is modeled as a graph of \texttt{GridEntity}
+implementations --- \texttt{House}, \texttt{SolarPanel}, \texttt{Storage} (battery), and a
+singleton \texttt{ExternalGrid} --- connected by \texttt{Cable} edges into a \texttt{GridGraph}
+(\cref{sec:glossary}), plus a global \texttt{Environment} capturing simulated time, irradiance
+and temperature. Every entity type keeps its \emph{static} configuration (capacity, surface,
+efficiency, \ldots) and its \emph{dynamic} state (e.g.\ \texttt{HouseState},
+\texttt{StorageState}) as separate, immutable case classes, both implementing the shared
+\texttt{GridEntity}/\texttt{GridEntityState} abstractions so the engine can treat every entity
+uniformly.
 
-  \item which \textbf{domain events} are there?
-  %
-  \begin{itemize}
-    \item e.g.~\emph{user registered}, \emph{product added to cart}, \emph{order placed}, \emph{etc.}
-  \end{itemize}
-  
-  \item which sorts of \textbf{messages} are exchanged?
-  %
-  \begin{itemize}
-    \item e.g.~\emph{commands}, \emph{events}, \emph{queries}, \emph{etc.}
-  \end{itemize}
+\textbf{Mapping to infrastructure.} State is deliberately asymmetric, server-authoritative:
+the \emph{static} model (\texttt{SimulationModel}: topology and entity specifications) and the
+per-entity \emph{dynamic} state are both owned by the backend, one \texttt{EntityActor} per
+grid entity and one \texttt{SimulationActor} per simulation. The GUI client never owns authoritative state: it only
+holds a short-lived, reactive \emph{projection} of whatever was last received from Kafka,
+rebuilt from scratch whenever a client (re)connects. The durable copy --- the full event
+history --- lives exclusively in each actor's own persistence journal and is \emph{not}
+duplicated in Kafka: Kafka carries transient, fire-and-forget notifications that are not
+required for correctness (see \cref{data-and-consistency-issues}), while the Kafka log itself
+provides a short, configurable replay window if a client needs to catch up.
 
-  \item what information does the \textbf{state} of the system comprehend
-  %
-  \begin{itemize}
-    \item e.g.~\emph{users' data}, \emph{products' data}, \emph{orders' data}, \emph{etc.}
-  \end{itemize}
-\end{itemize}
+\textbf{Domain events.} Two per-aggregate event streams are persisted for recovery/event
+sourcing: \texttt{SimulationEvent} (\texttt{Initialized}, \texttt{Started}, \texttt{Paused},
+\texttt{Stopped}, \texttt{TickAdvanced}, \texttt{SpeedUpdated}, \texttt{TickDeltaUpdated}) for
+\texttt{SimulationActor}, and \texttt{EntityEvent} (\texttt{Initialized}, \texttt{Evolved}) for
+\texttt{EntityActor}. Separately, three kinds of \emph{outward notifications} are broadcast on
+Kafka at run time: a per-entity telemetry snapshot, a per-tick global snapshot (environment and
+cable loads), and a control/status update (including the \texttt{degraded} flag, see
+\cref{fault-tolerance}) --- these are observations of state changes, not themselves part of the
+persisted domain log.
 
-\begin{quote}
-Class diagram are welcome here
-\end{quote}
+\textbf{Messages.} Three categories are exchanged, matching the classic command/event/query
+split: \emph{commands} sent as actor messages from the HTTP layer or from an internal scheduler
+to a specific actor (\texttt{Initialize}, \texttt{Start}, \texttt{Pause}, \texttt{Step},
+\texttt{Stop}, \texttt{UpdateSpeed}, \texttt{UpdateTickDelta}, and the internal
+\texttt{Evolve}/\texttt{TickTimer}); \emph{queries}, answered synchronously via the
+request--reply (\emph{ask}) pattern (\texttt{GetStatus}, the simulation list); and
+\emph{events/notifications}, which flow one way, either persisted (the domain events above) or
+broadcast on Kafka (telemetry).
+
+\textbf{System state.} At any point in time the state of one simulation comprehends: the
+static \texttt{SimulationModel} (graph, entity specs); the dynamic \texttt{SimulationState}
+(current \texttt{Environment}, each entity's \texttt{GridEntityState}, net energy
+\texttt{Flow} per entity, and resolved load per \texttt{Cable}); the \texttt{SimulationActor}'s
+own lifecycle metadata (\texttt{Status}, current tick number, run-time configuration such as
+speed/tick delta, and transient failure-handling counters, \cref{behaviour}); and, at the
+backend-process level, an in-memory registry of which simulation ids/presets currently exist
+(\texttt{SimulationRegistryActor}), used purely to answer the ``list simulations'' query.
+
+\cref{fig:domain-model-classes} depicts the core domain model introduced above.
+
+\begin{figure}[H]
+\centering
+\resizebox{\linewidth}{!}{%
+\begin{tikzpicture}[
+  >=Stealth, thin,
+  class/.style={draw, rectangle split, rectangle split parts=2,
+    rectangle split part fill={blue!8, white}, align=left, font=\tiny,
+    rounded corners=1pt, text width=27mm, inner sep=2pt},
+  abstractclass/.style={class, rectangle split part fill={orange!15, white}},
+  grp/.style={draw, dashed, rounded corners, inner sep=10pt},
+]
+
+  % --- Zone A: static entity hierarchy ---
+  \node[abstractclass] (GridEntity) at (-13, 10)
+    {\textit{GridEntity} \textrm{trait}\nodepart{two} + id: String};
+  \node[class] (House) at (-19, 6.5)
+    {House\nodepart{two} + id: String\\+ components: Iterable[GridEntity]\\+ strategy: ConsumptionStrategy};
+  \node[class] (SolarPanel) at (-15, 6.5)
+    {SolarPanel\nodepart{two} + id: String\\+ surface: Area\\+ efficiency: Double};
+  \node[class] (Storage) at (-11, 6.5)
+    {Storage\nodepart{two} + id: String\\+ maxCapacity: Energy\\+ maxChargePower: Power\\+ minSoC: Double};
+  \node[class] (ExternalGrid) at (-7, 6.5)
+    {ExternalGrid\nodepart{two} + id: String};
+
+  % --- Zone B: dynamic state hierarchy ---
+  \node[abstractclass] (GridEntityState) at (3, 10)
+    {\textit{GridEntityState} \textrm{trait}\nodepart{two} + entityId: String};
+  \node[class] (HouseState) at (-1, 6.5)
+    {HouseState\nodepart{two} + entityId: String\\+ componentStates: Iterable[GridEntityState]};
+  \node[class] (SolarPanelState) at (3, 6.5)
+    {SolarPanelState\nodepart{two} + entityId: String\\+ generatedPower: Power};
+  \node[class] (StorageState) at (7, 6.5)
+    {StorageState\nodepart{two} + entityId: String\\+ currentCharge: Energy};
+
+  % --- Topology ---
+  \node[class] (GridGraph) at (-13, 2)
+    {GridGraph\nodepart{two} + nodes: Iterable[GridEntity]\\+ cables: Iterable[Cable]};
+  \node[class] (Cable) at (-5, 2)
+    {Cable\nodepart{two} + connections: CableConnections\\+ maxCapacity: Power};
+  \node[class] (CableConnections) at (3, 2)
+    {CableConnections\nodepart{two} + n1: String\\+ n2: String};
+
+  % --- Simulation-level aggregates ---
+  \node[class] (SimulationModel) at (-13, -2)
+    {SimulationModel\nodepart{two} + grid: GridGraph};
+  \node[class] (SimulationState) at (-5, -2)
+    {SimulationState\nodepart{two} + environment: Environment\\+ entityStates: Map[String,GridEntityState]\\+ entityFlows: Map[String,Flow[Energy]]\\+ cableLoads: Map[Cable,Energy]};
+  \node[class] (Environment) at (-5, -6)
+    {Environment\nodepart{two} + startDateTime: LocalDateTime\\+ time: FiniteDuration\\+ irradiance: Irradiance\\+ temperature: Temperature};
+  \node[abstractclass] (Flow) at (3, -6)
+    {Flow[Energy] \textrm{enum}\nodepart{two} Surplus(amount)\\Deficit(amount)\\Balanced};
+
+  \begin{pgfonlayer}{background}
+    \node[grp, fit=(GridEntity)(House)(SolarPanel)(Storage)(ExternalGrid),
+      label={[font=\tiny]above left:Static configuration (immutable)}] (staticBox) {};
+    \node[grp, fit=(GridEntityState)(HouseState)(SolarPanelState)(StorageState),
+      label={[font=\tiny]above right:Dynamic state (mutable)}] (dynamicBox) {};
+  \end{pgfonlayer}
+
+  % Inheritance, zone A (hollow triangle points to the supertype)
+  \draw[-{Triangle[open]}] (House) -- (GridEntity);
+  \draw[-{Triangle[open]}] (SolarPanel) -- (GridEntity);
+  \draw[-{Triangle[open]}] (Storage) -- (GridEntity);
+  \draw[-{Triangle[open]}] (ExternalGrid) -- (GridEntity);
+
+  % Inheritance, zone B
+  \draw[-{Triangle[open]}] (HouseState) -- (GridEntityState);
+  \draw[-{Triangle[open]}] (SolarPanelState) -- (GridEntityState);
+  \draw[-{Triangle[open]}] (StorageState) -- (GridEntityState);
+
+  % Static vs dynamic: one concrete entity has exactly one concrete state counterpart
+  \draw[<->, dashed] (staticBox) -- (dynamicBox)
+    node[midway, above, font=\tiny] {1:1 per concrete entity (e.g.\ House $\leftrightarrow$ HouseState)};
+
+  % Topology associations
+  \draw[->] (GridGraph) -- (GridEntity) node[midway, left, font=\tiny] {nodes 1..*};
+  \draw[->] (GridGraph) -- (Cable) node[midway, above, font=\tiny] {cables 0..*};
+  \draw[->] (Cable) -- (CableConnections) node[midway, above, font=\tiny] {connections 1};
+
+  % Simulation-level aggregates
+  \draw[->] (SimulationModel) -- (GridGraph) node[midway, left, font=\tiny] {grid 1};
+  \draw[->] (SimulationState) -- (Cable) node[midway, right, font=\tiny] {cableLoads *};
+  \draw[->] (SimulationState) -- (Environment) node[midway, left, font=\tiny] {environment 1};
+  \draw[->] (SimulationState) -- (Flow) node[midway, below, font=\tiny] {entityFlows *};
+  \draw[->] (SimulationState) -- (GridEntityState)
+    node[pos=0.65, right, font=\tiny] {entityStates *};
+
+\end{tikzpicture}%
+}
+\caption{Core domain model of GridSim. Each concrete grid entity (\texttt{House},
+\texttt{SolarPanel}, \texttt{Storage}, \texttt{ExternalGrid}) is a static, immutable configuration
+object; all but \texttt{ExternalGrid} have a matching mutable state counterpart updated at every
+tick. \texttt{GridGraph}/\texttt{Cable}/\texttt{CableConnections} capture the static topology, while
+\texttt{SimulationModel} and \texttt{SimulationState} are the top-level static/dynamic aggregates
+held by \texttt{SimulationActor} (\cref{behaviour}).}
+\label{fig:domain-model-classes}
+\end{figure}
 
 \subsection{Interaction}\label{interaction}
 
+Interaction happens along two independent planes, deliberately kept separate (\cref{architecture}):
+
 \begin{itemize}
-  \item how do components \emph{communicate}? \emph{when}? \emph{what}?
-  \item \emph{which} \textbf{interaction patterns} do they enact?
+  \item \textbf{Control plane (HTTP, request/reply and fire-and-forget).} A GUI, or any other
+  HTTP client (\textsc{FR-13}), calls \texttt{SimulationControlRoutes} to create a simulation
+  or issue lifecycle commands. Fire-and-forget \emph{tell} is used for commands with no
+  meaningful return value (\texttt{start}, \texttt{pause}, \texttt{step}, \texttt{delete}),
+  while the \emph{ask} pattern (request/reply with a timeout) is used for queries that need an
+  answer (\texttt{status}, the simulation list). Every call is routed, through cluster
+  sharding's \texttt{EntityRef}, to the single \texttt{SimulationActor} instance owning that
+  simulation id, wherever in the cluster it currently lives.
+  \item \textbf{Data plane (Kafka, publish/subscribe).} The backend is the sole producer on
+  three per-simulation topics (entities, ticks, control); any number of GUI instances (or
+  external analytics consumers, \cref{sec:distributed-features}) subscribe independently,
+  decoupled in both time and multiplicity from the producer and from each other
+  (\textsc{FR-14}).
+  \item \textbf{Internal scatter/gather (actor ask, bounded by timeout).} Once running, on
+  every tick the \texttt{SimulationActor} \emph{scatters} an \texttt{Evolve} ask-request to
+  every \texttt{EntityActor} of the simulation, in parallel, and \emph{gathers} all replies
+  via \texttt{Future.sequence} piped back to itself as a single message
+  (\texttt{EntitiesEvolved} on success, \texttt{TickFailed} on timeout/exception). This keeps
+  the \texttt{SimulationActor}'s own single-threaded mailbox non-blocking while entity
+  evolutions genuinely execute concurrently (\textsc{NFR-6}).
 \end{itemize}
 
-\begin{quote}
-Sequence diagrams are welcome here
-\end{quote}
+\cref{fig:tick-sequence} traces one full cycle of this sequence, from the \texttt{Start}
+command to the recurring tick loop.
+
+\begin{figure}[H]
+\centering
+\begin{adjustbox}{max width=\textwidth}
+\begin{tikzpicture}[
+  >=Stealth, thin,
+  participant/.style={draw, rounded corners, align=center, minimum width=30mm,
+    minimum height=9mm, font=\footnotesize},
+]
+
+  \node[participant, fill=gray!10] (guiHead) at (0, 12) {GUI};
+  \node[participant, fill=blue!6] (simHead) at (6, 12) {SimulationActor};
+  \node[participant, fill=orange!10] (entHead) at (12, 12) {EntityActor(s)};
+  \node[participant, fill=green!8] (kafkaHead) at (18, 12) {Kafka Broker};
+
+  \draw[dashed, gray] (0, 11.5) -- (0, 2);
+  \draw[dashed, gray] (6, 11.5) -- (6, 2);
+  \draw[dashed, gray] (12, 11.5) -- (12, 2);
+  \draw[dashed, gray] (18, 11.5) -- (18, 2);
+
+  \begin{pgfonlayer}{background}
+    \draw[dashed, rounded corners] (-1.5, 10.5) rectangle (19.5, 4.3);
+  \end{pgfonlayer}
+  \node[anchor=north west, font=\tiny, fill=white, inner sep=1pt] at (-1.5, 10.5)
+    {loop [while Running]};
+
+  % Control plane: start the simulation (happens once, outside the loop)
+  \draw[->] (0, 11) -- (6, 11) node[midway, above, font=\tiny] {Start (tell)};
+
+  % Self-scheduled tick timer
+  \draw[->] (6, 10) -- (7.3, 10) -- (7.3, 9.6) -- (6, 9.6);
+  \node[anchor=west, font=\tiny] at (7.4, 9.8) {self: TickTimer};
+
+  % Internal scatter/gather
+  \draw[->] (6, 9) -- (12, 9)
+    node[midway, above, font=\tiny] {ask Evolve ($\times$ N, parallel)};
+  \draw[->, dashed] (12, 8) -- (6, 8) node[midway, below, font=\tiny] {EntityEvolved};
+
+  % Persist and resolve flows
+  \draw[->] (6, 7) -- (7.3, 7) -- (7.3, 6.6) -- (6, 6.6);
+  \node[anchor=west, font=\tiny] at (7.4, 6.8) {\shortstack{persist TickAdvanced;\\run power-flow solver}};
+
+  % Data plane: publish and async notify
+  \draw[->] (6, 6) -- (18, 6)
+    node[midway, above, font=\tiny] {publish tick + entity telemetry};
+  \draw[->, dashed] (18, 5) -- (0, 5)
+    node[midway, below, font=\tiny] {notify (pub/sub, async, decoupled)};
+
+  % Control plane: stop (happens once, ends the loop)
+  \draw[->] (0, 3) -- (6, 3) node[midway, above, font=\tiny] {Stop (tell)};
+
+\end{tikzpicture}
+\end{adjustbox}
+\caption{Sequence of messages for one simulation, from \texttt{Start} through one iteration of
+the recurring tick loop to \texttt{Stop}. Solid arrows are requests/commands, dashed arrows are
+replies or asynchronous notifications. The failure/retry branch taken on \texttt{TickFailed} is
+detailed separately in \cref{fault-tolerance}.}
+\label{fig:tick-sequence}
+\end{figure}
 
 \subsection{Behaviour}\label{behaviour}
 
-\begin{itemize}
-  \item how does \emph{each} component \textbf{behave} individually (e.g.~in \emph{response} to \emph{events} or messages)?
-  \begin{itemize}
-    \item some components may be \emph{stateful}, others \emph{stateless}
-  \end{itemize}
+\texttt{SimulationActor} --- stateful, explicit finite-state machine. Its
+\texttt{Status} is one of \texttt{Idle} (just initialized, awaiting \texttt{Start}),
+\texttt{Running} (actively scheduling ticks), \texttt{Paused} (suspended, resumable), or
+\texttt{Stopped} (terminal: no command restarts it). \texttt{Start} moves
+\texttt{Idle}/\texttt{Paused} $\rightarrow$ \texttt{Running} and self-schedules the first
+\texttt{TickTimer}; while \texttt{Running}, each \texttt{TickTimer}/\texttt{EntitiesEvolved}
+pair advances the tick counter and schedules the next timer; \texttt{Pause} moves
+\texttt{Running} $\rightarrow$ \texttt{Paused}; \texttt{Stop} moves any non-terminal state to
+\texttt{Stopped} unconditionally. Besides the persisted lifecycle, the actor keeps small,
+\emph{transient} (non-persisted) bookkeeping --- \texttt{consecutiveFailures} and a
+\texttt{degraded} flag --- purely to drive the retry/backoff behaviour of
+\cref{fault-tolerance}.
 
-  \item which components are in charge of updating the \textbf{state} of the system? \emph{when}? \emph{how}?
-\end{itemize}
+\textbf{\texttt{EntityActor} --- stateful, simpler reactive behaviour.} It reacts only to
+\texttt{Initialize} (adopt static config and initial dynamic state) and \texttt{Evolve}
+(compute and persist the next dynamic state and net energy flow for one tick, replying with
+the result); it has no explicit multi-state machine, only the presence/absence of its
+configuration and the bookkeeping (\texttt{lastTick}, \texttt{lastFlow}) needed for
+idempotent retries.
 
-\begin{quote}
-State diagrams are welcome here
-\end{quote}
+\textbf{\texttt{SimulationRegistryActor} --- minimal stateful bookkeeping.} It keeps an
+in-memory map from simulation id to preset name, updated on \texttt{RegisterSimulation}/
+\texttt{UnregisterSimulation} and read on \texttt{GetSimulations}; it is intentionally
+\emph{not} event-sourced, since it only indexes which simulations exist rather than their own
+state (\cref{availability}).
+
+\textbf{GUI --- effectively stateless from the server's point of view.} Views are purely
+declarative bindings; ViewModels are the only locally stateful components, caching the latest
+value received per channel as JavaFX reactive properties; a \texttt{Coordinator} mediates the
+Kafka subscriptions so views/view-models never deal with asynchronous I/O directly (MVVM, see
+also the project's own detailed-design notes).
+
+\textbf{State ownership and update timing.} All \emph{authoritative} state transitions
+happen exclusively inside the backend's actors: \texttt{SimulationActor} persists a lifecycle
+event whenever a command succeeds and a \texttt{TickAdvanced} event once all entities have
+replied for a tick; \texttt{EntityActor} persists an \texttt{Evolved} event every time it
+actually computes (as opposed to replays) a tick. The GUI never updates system state --- it
+only updates its own \emph{presentation} state, once per Kafka message received, which means
+the view is eventually consistent with, and always slightly behind, the authoritative backend
+state.
+
 
 \subsection{Data and Consistency Issues}\label{data-and-consistency-issues}
 
-\begin{itemize}
-  \item Is there any data that needs to be stored?
-  %
-  \begin{itemize}
-    \item \emph{what} data? \emph{where}? \emph{why}?
-  \end{itemize}
-  
-  \item how should \emph{persistent data} be \textbf{stored}?
-  %
-  \begin{itemize}
-    \item e.g.~relations, documents, key-value, graph, etc.
-    \item why?
-  \end{itemize}
-  
-  \item Which components perform queries on the database?
-  %
-  \begin{itemize}
-    \item \emph{when}? \emph{which} queries? \emph{why}?
-    \item concurrent read? concurrent write? why?
-  \end{itemize}
-  
-  \item Is there any data that needs to be shared between components?
-  %
-  \begin{itemize}
-    \item \emph{why}? \emph{what} data?
-  \end{itemize}
-\end{itemize}
+\textbf{Persisted data.} Two things are persisted: (a) the full event history of
+every \texttt{SimulationActor} and \texttt{EntityActor} (lifecycle and per-tick evolution
+events), so that a crash never loses already
+confirmed simulation history; and (b) periodic snapshots of \texttt{EntityActor} state (every
+100 events, retaining the last 2, with older events deleted on snapshot) purely to bound
+recovery time after many ticks. Deliberately, nothing else is persisted server-side.
+
+\textbf{Storage mechanism.} Pekko Persistence's event-sourcing abstraction is used
+: each aggregate (one \texttt{SimulationActor} or
+\texttt{EntityActor} per id) already is a single, independently addressable unit with its own
+append-only event log keyed by \texttt{PersistenceId}, which maps onto a
+key-value-shaped.
+There is no cross-aggregate join ever needed, since each actor only ever reads/replays its
+\emph{own} history. The current configuration uses the in-memory journal and a local
+flat-file snapshot store.
+
+\textbf{Store access patterns and concurrency.} Only the owning actor instance ever
+reads its own persisted events/snapshots, and only once, during recovery after a (re)start
+(\texttt{RecoveryCompleted}); no other component queries the persistence store directly. Writes
+are append-only and issued exclusively by that same actor instance. Cluster sharding guarantees
+at most one live instance of a given \texttt{persistenceId} across the whole cluster at any
+time (the \emph{single-writer} invariant), so concurrent writes to the same aggregate's journal
+are structurally impossible by construction, and there is consequently no need for
+optimistic/pessimistic locking or conflict resolution on the write path.
+
+\textbf{Data shared between components.} The per-tick \texttt{SimulationState} (environment,
+every entity's dynamic state, net flows, cable loads) is conceptually shared across
+\texttt{SimulationActor} and all of a simulation's \texttt{EntityActor}s, but never through
+shared mutable memory: each \texttt{EntityActor} owns and mutates only its own slice (its
+\texttt{GridEntityState}), returns it as an immutable value, and \texttt{SimulationActor}
+\emph{composes} the returned flows afterwards (feeding them to the power-flow solver) rather
+than reaching into another actor's state --- sharing by message-passing and composition, not by
+reference, which is what makes the single-writer property above hold.
 
 \subsection{Fault-Tolerance}\label{fault-tolerance}
 
+\textbf{Replication.} Redundancy is provided at two complementary levels. \emph{Placement}
+redundancy comes directly from cluster sharding: if a node leaves the cluster, every actor it
+was hosting is automatically re-spawned on a surviving node, with no operator intervention,
+and recovers by replaying its own persisted event log. \emph{State} durability is delegated
+entirely to the configured Pekko Persistence journal/snapshot-store plugin
+(\cref{data-and-consistency-issues}) rather than to ad-hoc application code, and the
+2-snapshot retention kept for each \texttt{EntityActor} is what keeps that replay fast.
+
+\textbf{Heart-beating / timeout / retry.} Three mechanisms operate at different scopes:
 \begin{itemize}
-  \item Is there any form of data \textbf{replication} / federation / sharing?
-  %
-  \begin{itemize}
-    \item \emph{why}? \emph{how} does it work?
-  \end{itemize}
-  
-  \item Is there any \textbf{heart-beating}, \textbf{timeout}, \textbf{retry mechanism}?
-  %
-  \begin{itemize}
-    \item \emph{why}? \emph{among} which components? \emph{how} does it work?
-  \end{itemize}
-  
-  \item Is there any form of \textbf{error handling}?
-  %
-  \begin{itemize}
-    \item \emph{what} happens when a component fails? \emph{why}? \emph{how}?
-  \end{itemize}
+  \item \emph{Cluster-level heart-beating}: Pekko's cluster membership protocol continuously
+  monitors node liveness and feeds a \textbf{Split Brain Resolver} configured with the
+  \texttt{keep-majority} strategy and a 10-second stabilization window --- after a network
+  partition, only the majority side is kept alive, which is what makes the single-writer
+  invariant of \cref{data-and-consistency-issues} hold even under partial network failures.
+  \item \emph{Per-tick timeout}: every \texttt{Evolve} ask-request from
+  \texttt{SimulationActor} to an \texttt{EntityActor} carries a configurable
+  \texttt{tickTimeout}; if any single entity fails to answer in time, the whole tick's
+  \texttt{Future.sequence} fails and the actor treats it as \texttt{TickFailed}.
+  \item \emph{Retry with exponential backoff}: on \texttt{TickFailed}, \texttt{SimulationActor}
+  does not retry immediately but reschedules the next \texttt{TickTimer} after
+  $\min(\mathit{base} \times 2^{\mathit{failures}-1}, \mathit{max})$ (defaults: 1\,s base,
+  30\,s cap), to avoid hammering an already-struggling dependency. After a configurable number
+  of consecutive failures (default 3) the simulation marks itself \texttt{degraded} and
+  broadcasts this on the control topic, so every connected GUI can visibly surface the
+  degradation instead of silently showing stale data.
 \end{itemize}
+
+\textbf{Idempotent retries (avoiding double processing).} Because a retried tick re-sends
+\texttt{Evolve} for the \emph{same} tick number, \texttt{EntityActor} remembers the last tick
+it actually completed (\texttt{lastTick}); if asked again for a tick it has already processed,
+it replies with its cached result instead of recomputing (and, crucially, without persisting a
+second \texttt{Evolved} event) --- preventing duplicate energy accounting and duplicate
+persisted events under Pekko's at-least-once delivery semantics.
+
+\textbf{Error handling / supervision.} Both \texttt{SimulationActor} and \texttt{EntityActor}
+declare an explicit \texttt{onPersistFailure} supervision strategy
+(\texttt{restartWithBackoff}, 200\,ms--5\,s, 0.2 jitter): on a crash or persistence failure,
+the faulty instance is torn down and a fresh one is restarted (transparently re-homed by
+cluster sharding if needed), which replays its persisted events/snapshot and, via the
+\texttt{RecoveryCompleted} signal, automatically re-arms the tick timer if the simulation was
+\texttt{Running} when it crashed --- so, from an operator's perspective, a crash shows up as a
+brief pause rather than data loss. Kafka publishing failures are treated as strictly
+\emph{non-critical}: publishers sit behind a small interface with a \texttt{NoOp}
+implementation, and a failure to publish telemetry never blocks or fails a tick --- simulation
+correctness never depends on telemetry delivery succeeding, only on the event-sourced journal.
 
 \subsection{Availability}\label{availability}
 
-\begin{itemize}
-  \item Is there any \textbf{caching} mechanism?
-  %
-  \begin{itemize}
-    \item \emph{where}? \emph{why}?
-  \end{itemize}
-  
-  \item Is there any form of \textbf{load balancing}?
-  %
-  \begin{itemize}
-    \item \emph{where}? \emph{why}?
-  \end{itemize}
+\textbf{Caching.} The only cache-like mechanisms are local to a single actor/process and
+exist for a specific, narrow reason rather than as a general performance optimization:
+\texttt{EntityActor}'s \texttt{lastFlow}/\texttt{lastTick} let a retried request be answered
+without recomputation (\cref{fault-tolerance}), and GUI ViewModels keep the latest received
+snapshot per channel so the interface always has something to render between two Kafka
+messages. No shared/distributed cache is used: per-tick state is already cheap
+to keep in the owning actor's memory, and introducing a second copy of that state elsewhere
+would only reopen the consistency problem that single ownership is designed to avoid.
 
-  \item In case of \textbf{network partitioning}, how does the system behave?
-  %
-  \begin{itemize}
-    \item \emph{why}? \emph{how}?
-  \end{itemize}
-\end{itemize}
-
-\subsection{Security}\label{security}
-
-\begin{itemize}
-  \item Is there any form of \textbf{authentication}?
-  %
-  \begin{itemize}
-    \item \emph{where}? \emph{why}?
-  \end{itemize}
-
-  \item Is there any form of \textbf{authorization}?
-  %
-  \begin{itemize}
-    \item which sort of \emph{access control}?
-    \item which sorts of users / \emph{roles}? which \emph{access rights}?
-  \end{itemize}
-
-  \item Are \textbf{cryptographic schemas} being used?
-  %
-  \begin{itemize}
-    \item e.g.~token verification,
-    \item e.g.~data encryption, etc.
-  \end{itemize}
-\end{itemize}
+\textbf{Behaviour under network partitioning.} The Split Brain Resolver
+(\cref{fault-tolerance}) governs this case: on a partition, the minority side is
+unconditionally downed (its shard regions and hosted actors stop), so it cannot keep accepting
+writes and silently diverge from the majority side, preserving the single-writer invariant
+relied upon by event sourcing. A GUI client connected to the minority side simply loses its
+HTTP/Kafka connection and surfaces that as a disconnection, rather than being fooled into
+showing locally-computed, inconsistent data. The in-memory
+\texttt{SimulationRegistryActor} follows a deliberately lighter-weight
+strategy: since it only indexes which simulation ids/presets currently exist rather than any
+simulation's actual state, keeping it as plain in-memory bookkeeping outside the
+event-sourcing path is proportionate to that narrow responsibility, while durability of what
+actually matters --- each simulation's own state --- remains guaranteed independently by its
+\texttt{SimulationActor}/\texttt{EntityActor} event log.
 
 \section{Implementation}\label{implementation}
 
-Please report here all the implementation (technology-dependent) choices you made while implementing your design.
+\textbf{Network protocols.} Three protocols connect the system's components, each matching the
+traffic shape of the channel it serves. The GUI drives simulation lifecycle commands
+(create/start/pause/step/stop, speed and tick-delta updates) through a synchronous
+\textbf{HTTP} API exposed by Pekko HTTP (\texttt{SimulationControlRoutes}) and consumed via
+Java's built-in \texttt{java.net.http.HttpClient} (\texttt{HttpSimulationApiClient}) ---
+request/response is a natural fit for these infrequent, one-shot commands. High-frequency
+telemetry (per-tick entity state, grid-wide tick summaries, control-channel broadcasts) instead
+flows one-way from backend to every connected GUI over \textbf{Apache Kafka}'s wire protocol, a
+publish/subscribe shape that cleanly supports multiple simultaneous GUI consumers without the
+backend tracking who is listening. Internally, the nodes forming the
+Pekko cluster communicate over \textbf{Pekko Artery} (TCP transport), which cluster sharding and
+the Split Brain Resolver rely on to exchange membership and
+entity-location information.
 
-\begin{quote}
-  If you run out of time for this project, you may consider leaving some aspect unimplemented, 
-  and simply discuss how you would have implemented them.
-  %
-  In this case, better would be to discuss unimplemented features in \cref{future-works}.
-\end{quote}
-
-\begin{itemize}
-  \item which \textbf{network protocols} to use?
-  %
-  \begin{itemize}
-    \item e.g.~UDP, TCP, HTTP, WebSockets, gRPC, XMPP, AMQP, MQTT, etc.
-  \end{itemize}
-  
-  \item how should \emph{in-transit data} be \textbf{represented}?
-  %
-  \begin{itemize}
-    \item e.g.~JSON, XML, YAML, Protocol Buffers, etc.
-  \end{itemize}
-  
-  \item how should \emph{databases} be \textbf{queried}?
-  %
-  \begin{itemize}
-    \item e.g.~SQL, NoSQL, etc.
-  \end{itemize}
-  
-  \item how should components be \emph{authenticated}?
-  %
-  \begin{itemize}
-    \item e.g.~OAuth, JWT, etc.
-  \end{itemize}
-
-  \item how should components be \emph{authorized}?
-  %
-  \begin{itemize}
-    \item e.g.~RBAC, ABAC, etc.
-  \end{itemize}
-\end{itemize}
+\textbf{In-transit data representation.} Representation follows the same three-way split.
+HTTP request/response bodies are \textbf{JSON}, marshalled with Pekko HTTP's \texttt{spray-json}
+integration on both the server (\texttt{SimulationControlRoutes}) and client
+(\texttt{HttpSimulationApiClient}) sides. Kafka payloads are \textbf{Protocol Buffers} messages,
+generated by ScalaPB from the schemas in the dedicated \texttt{protocols} Gradle module
+(\texttt{common.proto}, \texttt{entity\_state.proto}, \texttt{simulation\_data.proto}) and
+encoded/decoded through \texttt{SimulationDataCodecs} --- chosen over JSON for its compact
+binary footprint, given the volume of per-tick, per-entity messages; the one exception is the
+lightweight control-channel broadcast (status/speed/tick-delta/degraded), which uses a minimal
+hand-rolled pipe-delimited UTF-8 string (\texttt{SimulationControlCodec}), since a handful of
+primitive fields did not justify a full schema. Pekko's own remote messages (actor protocol case
+classes crossing node boundaries inside the cluster) are serialized with the
+\texttt{pekko-serialization-jackson} module.
 
 \subsection{Technological details}\label{technological-details}
 
 \begin{itemize}
-  \item any particular \emph{framework} / \emph{technology} being exploited goes here
+  \item \textbf{Apache Pekko} 1.7.0 --- typed actors, cluster, cluster sharding, and persistence
+  (typed), together with \textbf{Pekko HTTP} 1.1.0 and its \texttt{spray-json} module, form the
+  entire backend.
+
+  \item \textbf{Apache Kafka} 3.8.0 client library (\texttt{kafka-clients}) --- a
+  \texttt{KafkaProducer} on the backend (\texttt{TelemetryPublisher}) and a
+  \texttt{KafkaConsumer} on the GUI side, for all telemetry.
+
+  \item \textbf{Protocol Buffers} 3.25.5 with \textbf{ScalaPB} 0.11.17 --- schema definition and
+  Scala code generation for the Kafka message payloads, isolated in their own \texttt{protocols}
+  Gradle module.
+
+  \item \textbf{ScalaFX} 16.0.0-R24 over \textbf{JavaFX} 17.0.2 --- the desktop GUI, structured
+  as MVVM.
+
+  \item \textbf{Cats} 2.12.0, \textbf{Cats Effect} 3.5.4 and \textbf{FS2} 3.10.2 --- functional
+  programming constructs, e.g.\ \texttt{cats.data.ValidatedNec} used throughout
+  \texttt{org.gridsim.dsl} to accumulate scenario-validation errors rather than fail fast on the
+  first one.
+
+  \item \textbf{SmartGraph} 2.3.0 --- the JavaFX component used to render the grid topology
+  graph view.
+
+  \item A small internal \textbf{Scala DSL} (\texttt{org.gridsim.dsl}), built directly in Scala
+  with the builder pattern rather than through an external grammar/parser-generator, used to
+  author the grid scenarios/presets served by \texttt{GridScenarioCatalog}.
+
+  \item \textbf{ScalaTest} 3.2.20, with JUnit 4 interoperability via
+  \texttt{scalatestplus-junit}, as the testing framework; Pekko's \texttt{actor-testkit-typed},
+  \texttt{persistence-testkit} and \texttt{http-testkit} modules are used for actor,
+  event-sourcing and HTTP route tests respectively.
+
+  \item \textbf{Gradle} with the Kotlin DSL, the \textbf{Scala} 3.3.7 plugin on a
+  \textbf{Java 21} toolchain, and the Shadow plugin for building the application's fat jars;
+  a dedicated Gradle task starts/stops a Dockerized Kafka broker around the
+  \texttt{integrationTest} source set.
 \end{itemize}
 
 \section{Validation}\label{validation}
 
 \subsection{Automatic Testing}\label{automatic-testing}
 
-\begin{itemize}
-  \item how were individual components \textbf{\emph{unit}-test}ed?
-  
-  \item how was communication, interaction, and/or integration among components tested?
-  
-  \item how to \textbf{\emph{end-to-end}-test} the system?
-  %
-  \begin{itemize}
-    \item e.g.~production vs.~test environment
-  \end{itemize}
+\textbf{Unit testing.} 51 ScalaTest specs (\texttt{AnyFlatSpec} with \texttt{Matchers}, run
+through \texttt{JUnitRunner}) under \texttt{app/src/test/scala} cover the logic that does not
+need a running actor system: domain value objects (\texttt{Energy}, \texttt{Power},
+\texttt{Flow}, \texttt{Irradiance}, \ldots), the two power-flow solvers
+(\texttt{KirchhoffPowerFlowSolverSpec} and 
+\texttt{SimplePowerFlowSolverSpec}), entity evolution strategies
+(\texttt{SolarPanelStrategySpec}, \texttt{BatteryStrategySpec}, \texttt{HouseLogicSpec}), the
+DSL builders and their validators (\texttt{HouseBuilderSpec},
+\texttt{SimulationValidatorSpec}, \ldots), the Protobuf codecs
+(\texttt{SimulationDataCodecsSpec}, round-tripping every message type), and the statistics
+engine, whose module was developed test-first (TDD).
 
-  \item for each test specify:
-  %
-  \begin{itemize}
-    \item rationale of individual tests
-    \item how were the test automated
-    \item how to run them
-    \item which requirement they are testing, if any
-  \end{itemize}
-\end{itemize}
+\textbf{Actor and HTTP-route testing.} \texttt{EntityActorSpec} and \texttt{SimulationActorSpec}
+exercise the two event-sourced behaviours directly through Pekko's
+\texttt{ActorTestKit}/\texttt{PersistenceTestKit}: initialization, state carried forward across
+ticks, event persistence and replay after a restart, and snapshot persistence once the
+retention threshold (100 events) is reached. \texttt{SimulationControlRoutesTest} drives the
+HTTP layer (\texttt{SimulationControlRoutes}) through \texttt{pekko-http-testkit} without a real
+socket, checking the simulation-listing and preset-validation paths.
 
-\begin{quote}
-recall that \emph{deployment} \textbf{automation} is commonly used to \emph{test} the system in \emph{production-like} environment
-\end{quote}
+\textbf{Fault-injection / corner-case testing.} The same two actor specs are also where the
+mechanisms of \cref{fault-tolerance} are verified end-to-end: a tick that never gets all its
+entity replies produces \texttt{TickFailed} without advancing the counter or publishing
+telemetry; a batch that only partially completes leaves the already-persisted entities ahead of
+the orchestrator, and a retry of that stalled batch does not re-evolve (hence does not
+double-persist) those entities --- the idempotent-retry property is checked both at this
+orchestrator level and directly on \texttt{EntityActor} for a retried and for a stale
+\texttt{Evolve}; repeated \texttt{TickFailed} is checked to publish a \texttt{Degraded} control
+update after the configured threshold and clear it on the next successful tick; and a
+persistence failure on either actor is checked to restart it with backoff and resume correctly
+(re-arming the tick timer for \texttt{SimulationActor}, replaying events for
+\texttt{EntityActor}) rather than losing state.
 
-\begin{quote}
-recall to test corner cases (crashes, errors, etc.)
-\end{quote}
+\textbf{Integration testing.} Four specs under \texttt{app/src/test/integration} run against a
+real Apache Kafka broker and are kept in a separate Gradle task, \texttt{integrationTest}, so
+that the default \texttt{test} task (used in CI) never depends on Docker:
+\texttt{integrationTest} itself depends on a \texttt{startKafkaContainer} task that launches an
+\texttt{apache/kafka:latest} container (reusing one already listening on 9092, if present) and
+is finalized by a matching \texttt{stopKafkaContainer} task. \texttt{KafkaTelemetryIntegrationSpec}
+publishes real entity, tick, and multi-entity/multi-tick telemetry from
+\texttt{EntityActor}/\texttt{SimulationActor} and consumes it back with a plain
+\texttt{KafkaConsumer}, checking that the decoded Protobuf matches the original domain state
+exactly. \texttt{RemoteSimulationBuilderIntegrationSpec} goes one step further, consuming that
+same Kafka telemetry from the GUI side and checking that \texttt{RemoteSimulationBuilder}
+updates its reactive snapshot/statistics signals accordingly.
+\texttt{HttpApiUnavailableIntegrationSpec} and \texttt{KafkaUnavailableIntegrationSpec} are the
+project's crash tests for its two external dependencies: pointing the HTTP client at an
+unreachable host confirms it fails with a connect-timeout around its configured 5\,s timeout
+rather than hanging, and that \texttt{RemoteSimulationBuilder.build} falls back to
+\texttt{PAUSED} instead of blocking or throwing;}.
+
+\textbf{Automation.} Both Gradle tasks are wired into the project's GitHub Actions workflow
+(\texttt{.github/workflows/build.yml}), triggered on every push to \texttt{main}/\texttt{develop}
+and on every pull request: an \texttt{assemble} job compiles the project
+(\texttt{ciAssemble}) on Ubuntu with JDK 21, followed by a \texttt{build} job that runs
+\texttt{ciBuild} (compile \texttt{+} unit \texttt{test}) across an Ubuntu/macOS/Windows matrix.
+\texttt{integrationTest} is intentionally left out of this CI pipeline, since it depends on a
+locally running Docker daemon, and is instead a developer-invoked task
+(\texttt{./gradlew integrationTest}).
 
 \subsection{Acceptance test}\label{acceptance-test}
 
-\begin{itemize}
-  \item did you perform any \emph{manual} testing?
-  %
-  \begin{itemize}
-    \item what did you test?
-    \item why wasn't it automatic?
-  \end{itemize}
-\end{itemize}
+\textbf{Manual testing of the GUI.} The ScalaFX client is the one component validated manually
+rather than automatically, for the reason already stated in \cref{automatic-testing}: it only
+renders state produced by the simulation engine and statistics subsystem, both already covered
+by the test suite above, so manual verification during development was limited to running the
+application end-to-end (backend cluster, Kafka, and GUI together) and visually checking that
+each view reflected the expected simulation state and transitions.
 
 \section{Deployment}\label{deployment}
 
@@ -909,31 +1308,166 @@ recall to test corner cases (crashes, errors, etc.)
 
 \section{User Guide}\label{user-guide}
 
-\begin{itemize}
-  \item how to use your software?
-  %
-  \begin{itemize}
-    \item provide instructions
-    \item provide expected outcomes
-    \item provide screenshots if possible
-  \end{itemize}
-\end{itemize}
+\textbf{Starting the system.} The backend must be started before the GUI, since the GUI only
+ever talks to an already-running backend over HTTP/Kafka (\cref{implementation}) and has no
+local simulation logic of its own. Two dedicated Gradle tasks start each half of the
+application: \texttt{./gradlew :app:runBackend} launches \texttt{ActorMain}, which forms the
+Pekko cluster, binds the HTTP API on \texttt{0.0.0.0:8080}, and connects to Kafka on
+\texttt{localhost:9092}; \texttt{./gradlew :app:runGui} launches \texttt{GuiApp}, the JavaFX
+client, which by default points at that same \texttt{http://localhost:8080} API and
+\texttt{localhost:9092} Kafka broker. Both endpoints are overridable from the command line
+(e.g.\ \texttt{./gradlew :app:runGui --args="--api=http://HOST:8080 --kafka=HOST:9092"}) to
+point the GUI at a backend running on a different machine, which is what makes the
+client--server split of \cref{architecture} usable across a real network rather than only on
+\texttt{localhost}.
+
+\textbf{Creating and watching a simulation.} On launch, the GUI opens on the
+\emph{Running Simulations} screen, listing whatever simulations are already registered on the
+backend (\texttt{SimulationRegistryActor}, \cref{behaviour}), each with a \emph{Watch} action to
+open its dashboard and a \emph{Stop} action to terminate it.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.85\linewidth]{figures/simulations-lis.png}
+  \caption{The Running Simulations screen, listing every simulation currently registered on the
+  backend.}
+  \label{fig:gui-running-simulations}
+\end{figure}
+
+From there, \emph{Start New Simulation} moves to the \emph{Scenario Selection} screen, where the
+user picks one of the four built-in presets served by \texttt{GridScenarioCatalog} ---
+\texttt{base-neighborhood} (three houses, one with solar panels and a battery),
+\texttt{advanced-neighborhood} (five houses with a more varied mix of renewable/storage
+components), \texttt{solar-farm-grid} (a 100\,kW solar farm feeding four houses), and
+\texttt{incoherent-neighborhood} (deliberately invalid parameters, kept to manually exercise the
+DSL's validation path of \cref{modelling}) --- together with the desired tick duration (an
+amount plus a unit: seconds/minutes/hours/days) and start date/time for the simulated clock.
+Confirming creates the simulation on the backend and switches the GUI straight to its dashboard.
+
+\begin{figure}[H]
+  \centering
+    \includegraphics[width=0.85\linewidth]{figures/scenario-selection.png}
+  \caption{The Scenario Selection screen, where one of the four built-in presets and the
+  simulation's starting parameters are chosen.}
+  \label{fig:gui-scenario-selection}
+\end{figure}
+
+\textbf{The simulation dashboard.} This screen is where \cref{architecture}'s client--server
+split is most visible: every control simply calls the HTTP API, and every visualization simply
+reflects the latest Kafka telemetry (\cref{implementation}), with nothing computed locally. A
+control bar shows the current status (\texttt{SIMULATION STATUS: \ldots}, plus a
+\texttt{DEGRADED} warning badge when \cref{fault-tolerance}'s retry mechanism reports repeated
+tick failures), a Play/Pause toggle, a \emph{Step} button to advance exactly one tick while
+paused, an \emph{Exit} button to leave the dashboard, a tick-duration amount/unit editor, and
+four speed toggles (labelled $0.5\times$/$1\times$/$2\times$/$10\times$, corresponding to one
+simulated tick every 2\,s/1\,s/500\,ms/100\,ms of real time). The rest of the main panel is a
+graph view of the grid topology (nodes for every entity, edges for cables, redrawn as energy
+flows change) next to an entity-details panel that fills in with the properties, installed
+components and live measurements of whichever node or cable the user last clicked.
+
+\begin{figure}[H]
+  \centering
+    \includegraphics[width=0.85\linewidth]{figures/grid-panel.png}
+  \caption{The simulation dashboard's main panel, showing the control bar, the grid topology
+  graph, and the entity details panel.}
+  \label{fig:gui-dashboard}
+\end{figure}
+
+Alongside the main panel, a set of live statistics views --- energy flow, battery charge levels,
+cable-overload alerts, a net-flow history chart, and elapsed simulation time --- is fed by the
+same backend-computed statistics module and updates on every tick together with the rest of the
+dashboard.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.85\linewidth]{figures/satistics-panel.png}
+  \caption{The statistics panel, showing the live views computed by the backend's statistics
+  module.}
+  \label{fig:gui-statistics}
+\end{figure}
 
 \section{Self-evaluation}\label{self-evaluation}
 
-\begin{itemize}
-  \item An individual section is required for each member of the group
-  \item Each member must self-evaluate their work, listing the strengths and weaknesses of the product
-  \item Each member must describe their role within the group as objectively as possible.
-\end{itemize}
+\subsection{Michele Nardini}\label{self-evaluation-nardini}
 
-It should be noted that each student is only responsible for their own section.
+\textbf{Role.} Within the group, I was mainly responsible for the project's core domain model ---
+\texttt{House}, \texttt{Battery} and the
+\texttt{EnergyResolver} type-class hierarchy that \cref{modelling} is built on --- together with
+large parts of the simulation engine and actor-model layer: decoupling \texttt{FlowSolver} from
+\texttt{SimulationEngine} so either power-flow solver can be plugged in, introducing cancellable
+scheduled ticking, and implementing the tick-validation and fault-tolerance behaviour described in
+\cref{fault-tolerance}, which I validated directly by writing the \texttt{EntityActor},
+\texttt{SimulationActor}, and HTTP/Kafka crash tests listed in \cref{automatic-testing}. On the GUI
+side, I migrated the \emph{Scenario Selection}, \emph{Entity Details} and \emph{Summary} views to
+the MVVM pattern of \cref{behaviour}, including the \texttt{DetailExtractor} component that reads
+entity state for the view.
+
+\subsection{System Evaluation}
+
+\textbf{Strengths of the product.} The actor model is used consistently rather than only
+nominally: every \texttt{EntityActor} and \texttt{SimulationActor} owns its state exclusively and
+is only ever touched through messages, so even though every tick evolves many entities
+conceptually "in parallel", there is no shared mutable state and therefore no lock and no data
+race to get wrong, by construction rather than by discipline. On top of that, cluster sharding
+gives the system location transparency: \texttt{SimulationActor} addresses an \texttt{EntityActor}
+by a stable id and never needs to know, or change, which physical node currently hosts it, which
+is precisely what would let the set of simulations and entities scale across more machines without
+touching the actors' own logic. Fault tolerance is handled the way a distributed system is
+expected to: event sourcing (\cref{data-and-consistency-issues}) makes every actor's state
+recoverable and replayable after a restart; a repeatedly-failing tick is retried rather than
+treated as fatal, and that retry is idempotent --- entities already evolved for a tick are
+recognised and not re-evolved on a duplicate or retried message, which is exactly the
+at-least-once delivery semantics a distributed system has to assume rather than the
+exactly-once semantics it would be convenient (but wrong) to assume; and the Split Brain
+Resolver's \texttt{keep-majority} strategy gives the cluster a principled, deterministic answer to
+a network partition instead of leaving split-brain behaviour undefined. Finally, the backend and
+every GUI client are decoupled through Kafka's publish/subscribe telemetry channel
+(\cref{implementation}): several GUI instances can watch the same simulation concurrently without
+the backend tracking who is listening, and because publishing is fire-and-forget from the
+backend's side, a slow or disconnected GUI consumer cannot slow down or block the tick loop that
+produces that telemetry. All of this is not only designed but verified: the crash tests in
+\cref{automatic-testing} exercise the retry, idempotency, degraded-status and backoff-restart
+behaviour against an actually failing dependency, not only against a diagram.
+
+\textbf{Weaknesses of the product.} The most significant one is that persistence undermines part of what the cluster is for: both the event journal and
+the snapshot store live on whichever single node currently hosts a given shard
+(\cref{data-and-consistency-issues}), with nothing replicated to any other node, so losing that one
+node still loses the simulation regardless of how many other nodes are in the cluster. The same
+single-point-of-failure pattern repeats one layer up, on the Kafka side: every producer and
+consumer in the project is configured against one broker address, so the pub/sub channel that
+decouples backend and GUI concurrency is itself not fault-tolerant. Finally, none of the HTTP
+control API or the Kafka topics require any credentials, which is a concurrency-adjacent weakness
+too: in the current design, any client that can reach the cluster can issue commands or read
+telemetry for every simulation, with no isolation between concurrently running simulations beyond
+their ids.
 
 \section{Future works}\label{future-works}
 
-Discuss possible future works, improvements, extensions, optimizations, etc.
+\textbf{Durable, replicated persistence.} The backend's event journal is currently the
+in-memory Pekko Persistence plugin (\cref{implementation}), so a simulation's entire tick/event
+history is lost the moment the process restarts; the
+local snapshot store survives a restart but not a lost disk. A production-ready version would
+swap both plugins for a networked one so that \texttt{EntityActor} and \texttt{SimulationActor}
+state is replicated outside the node that hosts the shard, which is also the missing piece needed
+to make cluster sharding's shard rebalancing (\cref{fault-tolerance}) actually move a simulation to
+a surviving node after a crash rather than merely resume it in place after a restart.
 
-Also discuss here any unimplemented feature, and how you would have implemented it.
+\textbf{Authentication and authorization.} Neither the HTTP control API nor the Kafka topics
+require any credentials (\cref{implementation}), which is acceptable on the trusted local network
+the project was developed and demonstrated on, but would need to change before exposing the system
+beyond it. On the HTTP side this would mean adding a Pekko HTTP \texttt{SecurityDirective} (e.g.\
+JWT bearer-token validation) in front of \texttt{SimulationControlRoutes}; on the Kafka side, it
+would mean enabling SASL/TLS on the broker and configuring matching credentials in both
+\texttt{KafkaEntityTelemetryPublisher} (producer) and the GUI's consumer.
+
+\textbf{System health checks.} There is currently no endpoint or signal that reports whether a
+backend node, or the cluster as a whole, is actually healthy: \texttt{SimulationControlRoutes}
+only exposes per-simulation status (\cref{implementation}), and \texttt{ActorMain} never subscribes
+to Pekko Cluster's own membership events, so a node joining, leaving, or being marked unreachable
+by the Split Brain Resolver (\cref{fault-tolerance}) produces no observable signal outside of the
+cluster's internal logs. Adding the \texttt{pekko-management} module's cluster-health HTTP routes would give each node a liveness/readiness probe, which is also what a real multi-node
+deployment would need in order for an external orchestrator to know when a
+node is safe to route traffic to, or when it should be restarted.
 
 \bibliographystyle{plain}
 \bibliography{references}
