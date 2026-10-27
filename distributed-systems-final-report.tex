@@ -17,6 +17,8 @@
 \usepackage{cleveref} % this must be the last package to be loaded
 
 
+\setlength{\emergencystretch}{3em}
+
 \newcommand{\emailaddr}[1]{\href{mailto:#1}{\texttt{#1}}}
 
 \title{\LARGE
@@ -42,7 +44,9 @@ the cables connecting them --- as a genuinely distributed, tick-driven system ra
 single-process program. On the backend, every grid entity and every running simulation is an
 independent, event-sourced Apache Pekko actor: cluster sharding gives each one a stable identity
 regardless of which node currently hosts it, and Pekko Persistence lets it recover its exact state
-after a restart by replaying its event log. Each simulated tick is a scatter/gather exchange
+by replaying its event log. Because that log is kept in a Redis store shared by every backend
+node, rather than inside the node that hosts the actor, a simulation survives not only an actor
+restart but also the crash of a whole node, resuming on a surviving one. Each simulated tick is a scatter/gather exchange
 between a simulation's orchestrating actor and its entities, guarded by a timeout; a timed-out
 tick is retried with exponential backoff, the retry is idempotent with respect to the
 at-least-once delivery a distributed system has to assume, and a run of repeated failures is
@@ -79,11 +83,11 @@ More precisely, the product is a hybrid of two of the categories listed above:
   engine that computes it.
 \end{itemize}
 
-The two parts can run together in a single JVM process (local mode) or be split across different machines/processes
-(distributed mode): a headless backend node (or cluster of nodes) running the simulation,
-and one or more GUI clients connecting remotely via HTTP (control plane) and Kafka (data
-plane). A Launcher component selects at startup which configuration to run (embedded,
-backend-only, or remote GUI).
+The two parts always run as separate processes: a headless backend node (or cluster of
+nodes) running the simulation, and one or more GUI clients connecting to it via HTTP (control
+plane) and Kafka (data plane), either on the same machine or from a different one. A Launcher
+component selects at startup which process to run: a single-node backend for local
+development, a clustered backend replica, or the GUI.
 
 In addition to the interactive product, the project also provides a small embedded Domain
 Specific Language (DSL), written in Scala, used to declaratively describe a micro-grid
@@ -99,8 +103,8 @@ environment is updated, each entity resolves
 its local energy balance (e.g., a house nets its consumption against its own solar
 production and battery), and the residual surplus/deficit is routed through the micro-grid
 topology using a power-flow algorithm, ultimately settling any
-unbalanced energy with the External Grid. All intermediate states are kept immutable, so
-the full history of a simulation run can be reconstructed and analyzed.
+unbalanced energy with the External Grid. All intermediate states are kept immutable, and
+the user can look back at how the simulation evolved over its most recent ticks.
 
 Users are not necessarily co-located with the machine running the simulation. The
 simulation engine can run on a dedicated backend (e.g., a lab/cluster machine or a cloud VM
@@ -125,11 +129,16 @@ In this project, data is closer to "simulation state" than classic personal user
     \item \textbf{Simulation state}, modeled as two parts: an immutable static model (topology, entity
     specifications) and dynamic state (environment, battery charge, flows), held by the backend actors.
     \item \textbf{Event history}: every state transition is persisted as an event (event sourcing) in a
-    persistence journal, plus periodic snapshots, enabling crash recovery and historical
-    reconstruction of a run.
+    persistence journal, plus periodic snapshots, both kept in a Redis store shared by all
+    backend nodes, enabling crash recovery (even on a different node). The journal is a
+    recovery mechanism rather than an archive: entity events already covered by a snapshot are
+    deleted, so what is retained is enough to rebuild the \emph{current} state of a run, not
+    its whole past.
     \item \textbf{Telemetry stream}: per-tick snapshots are also published to Kafka topics so that GUI
     clients (and, potentially, external analytics consumers) can observe simulation evolution
-    without querying the backend state directly.
+    without querying the backend state directly. Within the broker's retention, these topics
+    also hold the per-tick history of a run, which a GUI replays from the beginning when it
+    opens a simulation.
 \end{itemize}
 
 \section{Distribution motivations}
@@ -153,8 +162,8 @@ and geographic distribution as secondary but still relevant drivers.
     and evolved concurrently, rather than sequentially in a single-threaded loop. This allows
     larger micro-grids (more entities) to be simulated and allows horizontal scaling by adding more
     backend nodes to the cluster as the simulated grid grows.
-    \item \textbf{Fault tolerance}. Because the simulation state is valuable and the system is meant to run continuously, the architecture uses event sourcing (every state transition persisted as an event) plus periodic snapshotting, together with actor supervision strategies and automatic recovery on restart. This means an Entity or Simulation crash does not lose simulation history and the system can resume from the
-    last known consistent state rather than failing the whole simulation.
+    \item \textbf{Fault tolerance}. Because the simulation state is valuable and the system is meant to run continuously, the architecture uses event sourcing (every state transition persisted as an event) plus periodic snapshotting, together with actor supervision strategies and automatic recovery on restart. This means an Entity or Simulation crash does not lose any already persisted state transition and the system can resume from the
+    last known consistent state rather than failing the whole simulation. Since the journal and snapshots live in a Redis store outside the backend nodes, this holds even when the node hosting a simulation crashes: the simulation is re-spawned on a surviving node and recovers the same state there.
     \item  \textbf{Geographic/organizational distribution}. the HTTP+Kafka boundary between GUI and backend is designed precisely so that a GUI client can be run anywhere with network access to the backend's exposed endpoints, which is relevant for scenarios such as a shared simulation server observed by multiple
     analysts from different workstations.
 \end{itemize}
@@ -255,10 +264,13 @@ and geographic distribution as secondary but still relevant drivers.
   equals zero (energy conservation). \\
 
   FR-9 &
-  The system shall persist every intermediate simulation state immutably,
-  enabling later reconstruction of the full history of a run. &
-  After $n$ ticks, the state at any tick $k \leq n$ can be retrieved or
-  reconstructed unchanged, even after a process restart. \\
+  The user shall be able to visualize the evolution of a simulation over its
+  last $n$ ticks, including the ticks elapsed before the simulation was
+  opened in the GUI. &
+  After a simulation has run for $m \geq n$ ticks, opening it in a GUI
+  client shows the last $n$ ticks of its history (in the current
+  implementation $n = 200$, in the net-flow chart of the statistics
+  panel). \\
 
   FR-10 &
   The user shall be able to visualize the micro-grid as a real-time,
@@ -526,9 +538,9 @@ and geographic distribution as secondary but still relevant drivers.
   and
   both \texttt{SimulationActor} and \texttt{EntityActor} use a
   restart-with-backoff supervision strategy with automatic recovery
-  (\texttt{RecoveryCompleted} re-arming the tick timer). \textbf{Availability under
-  partial failure is a known weak point, explicitly tracked and being closed.}
-  This makes dependability one of the two primary distribution drivers for the project.
+  (\texttt{RecoveryCompleted} re-arming the tick timer). Events and snapshots are written to a
+  Redis store shared by all backend nodes, so the loss of a single node does not lose the
+  simulations it was hosting: they are re-spawned elsewhere and recover from the same store.
 
   \item[Scalability --- relevant.]
   The system is designed to scale with the \emph{size of the simulated grid}
@@ -541,15 +553,6 @@ and geographic distribution as secondary but still relevant drivers.
   engineering/educational tool used by a small number of operators per
   deployment.
 
-  \item[Security, trust --- not a primary concern.]
-  There is no end-user authentication/authorization model, no multiple
-  permission levels, and no sensitive personal data; the ``data'' being
-  protected is simulation state, not user secrets. Given the
-  academic/experimental scope and the absence of a multi-tenant security
-  boundary, this dimension is explicitly \textbf{out of scope} for the
-  current
-  requirements.
-
   \item[Resource sharing --- relevant.]
   Decoupling the engine from the GUI via HTTP (control) and Kafka
   (telemetry)
@@ -559,14 +562,6 @@ and geographic distribution as secondary but still relevant drivers.
   running
   simulation, and one backend can run several simulations concurrently. This
   is the second primary distribution driver, alongside fault tolerance.
-
-  \item[Openness, interoperability, heterogeneity --- moderately relevant.]
-  The backend exposes a plain HTTP REST API and plain Kafka topics rather
-  than
-  a proprietary, actor-only protocol; this means any HTTP client or Kafka
-  consumer, not necessarily built in Scala/Pekko, can control a simulation
-  or
-  read its telemetry.
 
   \item[Evolvability, maintainability --- relevant]
   The Functional Core/Imperative Shell and Observer-based dispatch patterns
@@ -585,11 +580,6 @@ and geographic distribution as secondary but still relevant drivers.
   control latency) matters insofar as it must not interfere with real-time
   GUI updates; efficiency is a secondary
   requirement rather than a hard constraint.
-
-  \item[Economy, costs --- minor relevance.]
-  As an academic project, there is no production budget to optimize against;
-  however, the choice of exclusively open-source technologies and an in-memory/local persistence backend for development reflects a general intent to minimize infrastructure cost and setup
-  complexity rather than an explicit budget constraint.
 
 \end{description}
 
@@ -640,7 +630,7 @@ to asynchronous messages).
 
 \subsection{Infrastructure}\label{infrastructure}
 
-Four infrastructural component \emph{kinds} appear in the design:
+Five infrastructural component \emph{kinds} appear in the design:
 
 \begin{itemize}
   \item \textbf{Backend node(s)}: one or more Apache Pekko \texttt{ActorSystem} processes
@@ -649,34 +639,44 @@ Four infrastructural component \emph{kinds} appear in the design:
   shard regions available to host entities (\textsc{NFR-6}).
   \item \textbf{HTTP API endpoint}: a Pekko HTTP server bound on every backend node
   (port \texttt{8080}) exposing \texttt{SimulationControlRoutes}, the control plane for
-  \textsc{FR-12}/\textsc{FR-13}.
+  \textsc{FR-12}/\textsc{FR-13}. In the containerized deployment the nodes are reached through
+  an \textbf{HTTP gateway} that spreads requests across them and skips
+  a node that stops answering, so clients only ever see one address (\cref{deployment}).
   \item \textbf{Message broker}: a single Apache Kafka broker acting as the data plane,
   carrying three logical topic families per simulation, satisfying \textsc{FR-14}.
+  \item \textbf{Persistence store}: a single Redis instance shared by every backend node,
+  holding the Pekko Persistence event journal and snapshot store of all actors. Keeping it
+  outside the backend nodes is what lets an actor recover its state on whichever node it is
+  re-spawned on (\cref{data-and-consistency-issues}).
   \item \textbf{GUI client(s)}: one or more ScalaFX desktop processes, each independently subscribing to the data plane and issuing control-plane
   calls.
 \end{itemize}
 
-\textbf{Network placement.} Backend node(s) and the Kafka broker are expected to sit on the same
-machine, while GUI clients may run on a \emph{different} host on
-that same network.. A \texttt{Launcher} entry point selects at startup
-whether a given process runs as \texttt{backend} (headless actor system + HTTP + Kafka
-producer) or as \texttt{gui} (ScalaFX client), or both together in a single JVM for local,
-single-machine use.
+\textbf{Network placement.} Backend nodes, the Kafka broker and the Redis store are expected
+to sit on the same machine (or the same trusted network; the provided \texttt{compose.yml} runs
+them as containers of one Compose project), while GUI clients may run on a \emph{different} host on
+that same network. A \texttt{Launcher} entry point selects at startup whether a given process
+runs as \texttt{backend} (\texttt{ActorMain}: a single-node backend with in-memory
+persistence, for local development), as \texttt{backend-cluster} (\texttt{ClusterMain}: one
+replica of the clustered backend, configured through environment variables and used in the
+containerized deployment), or as \texttt{gui} (the ScalaFX client).
 
 \textbf{Discovery/naming.} Two different, deliberately simple naming mechanisms are used,
-reflecting the project's static, small-scale deployment scope rather than a dynamic/elastic
-one:
+reflecting the project's small-scale deployment scope:
 \begin{itemize}
-  \item \emph{Inside} the backend cluster, nodes locate each other via a statically
-  configured seed-node list (\texttt{pekko.cluster.seed-nodes}); once joined, \emph{entities} are
+  \item \emph{Inside} the backend cluster, nodes find each other through seed nodes. In the
+  containerized deployment no address is configured by hand: each replica resolves the name of
+  its Compose service (\texttt{CLUSTER\_SERVICE\_NAME}) through Docker's internal DNS and uses
+  every address returned as a seed node, so replicas can be added or restarted without
+  reconfiguring the others; an explicit list (\texttt{PEKKO\_SEED\_NODES}) can be given
+  instead, and the single-node \texttt{ActorMain} simply uses itself. Once joined, \emph{entities} are
   addressed by stable logical identifiers (\texttt{simulationId} for a
   \texttt{SimulationActor}, \texttt{simulationId-localId} for an \texttt{EntityActor}) that
   cluster sharding resolves to a physical node transparently, giving \emph{location
   transparency} as already motivated in \cref{sec:distributed-features}.
   \item \emph{Between} client and server, there is no discovery layer at all: the GUI is
-  pointed directly at the backend's HTTP and Kafka endpoints via CLI arguments
-  (\texttt{--api}, \texttt{--kafka}, defaulting to \texttt{localhost}), which is an accepted
-  simplification given the single-backend, operator-driven deployment model;
+  pointed directly at the HTTP gateway and the Kafka broker via CLI arguments
+  (\texttt{--api}, \texttt{--kafka}, defaulting to \texttt{localhost}).
 \end{itemize}
 
 \cref{fig:infrastructure-components} summarizes the components discussed above.
@@ -695,6 +695,8 @@ one:
     fill=green!8, inner sep=4pt},
   client/.style={draw, rounded corners, align=center, minimum width=34mm, minimum height=10mm,
     fill=gray!10, inner sep=4pt},
+  store/.style={draw, rounded corners, align=center, minimum width=36mm, minimum height=12mm,
+    fill=red!8, inner sep=4pt},
   grp/.style={draw, dashed, rounded corners, inner sep=6pt},
   netgrp/.style={draw, dash dot, rounded corners, inner sep=14pt},
 ]
@@ -704,7 +706,7 @@ one:
   \node[client] (gui) at (0.3, 7.6) {GUI};
 
   % Control plane endpoint
-  \node[comp] (http) at (-4.5, 3.6) {HTTP API};
+  \node[comp] (http) at (-4.5, 3.6) {HTTP gateway};
 
   % Data plane broker
   \node[broker] (kafka) at (4.5, 3.6)
@@ -728,7 +730,7 @@ one:
   % Control plane
   \draw[<->] (gui) -- (http)
     node[midway, above, sloped, font=\footnotesize] {REST/JSON};
-  \draw[->] (http) -- (node1) node[midway, left, font=\footnotesize] {route via \texttt{EntityRef}};
+  \draw[->] (http) -- (node1) node[midway, left, font=\footnotesize] {forward};
   \draw[->] (http) -- (node2);
 
   % Cluster membership
@@ -736,16 +738,22 @@ one:
     node[midway, below, font=\footnotesize] {seed-nodes};
 
   % Data plane
-  \draw[->] (node1) -- (kafka) node[midway, below, font=\footnotesize] {publish)};
+  \draw[->] (node1) -- (kafka) node[midway, below, font=\footnotesize] {publish};
   \draw[->] (node2) -- (kafka);
   \draw[->] (kafka) to[bend left=12]
     node[midway, right, font=\footnotesize] {subscribe} (gui);
 
+  % Shared persistence store
+  \node[store] (redis) at (0, -4.6) {Redis\\\footnotesize journal + snapshot store};
+  \draw[<->] (node1) -- (redis) node[midway, below left, font=\footnotesize] {persist / recover};
+  \draw[<->] (node2) -- (redis);
+
 \end{tikzpicture}
 \caption{Infrastructural components of GridSim and their placement. A GUI client reaches the
 backend cluster's HTTP API for lifecycle commands/queries (control plane) and the Kafka broker
-for telemetry (data plane); cluster sharding routes each HTTP call to whichever node currently
-owns the targeted \texttt{SimulationActor}/\texttt{EntityActor}. Backend nodes and the broker
+for telemetry (data plane); the gateway forwards each HTTP call to one of the nodes, and cluster sharding routes it to whichever node currently
+owns the targeted \texttt{SimulationActor}/\texttt{EntityActor}, and every node persists and
+recovers actor state through the same shared Redis store. Backend nodes, the broker and Redis
 are expected to share a trusted network, while GUI clients may be remote.}
 \label{fig:infrastructure-components}
 \end{figure}
@@ -767,17 +775,21 @@ the \emph{static} model (\texttt{SimulationModel}: topology and entity specifica
 per-entity \emph{dynamic} state are both owned by the backend, one \texttt{EntityActor} per
 grid entity and one \texttt{SimulationActor} per simulation. The GUI client never owns authoritative state: it only
 holds a short-lived, reactive \emph{projection} of whatever was last received from Kafka,
-rebuilt from scratch whenever a client (re)connects. The durable copy --- the full event
-history --- lives exclusively in each actor's own persistence journal and is \emph{not}
+rebuilt from scratch whenever a client (re)connects. The durable copy --- the events and
+snapshots needed to rebuild the current state --- lives exclusively in each actor's own persistence journal, held in the shared Redis
+store rather than on the node hosting the actor, and is \emph{not}
 duplicated in Kafka: Kafka carries transient, fire-and-forget notifications that are not
 required for correctness (see \cref{data-and-consistency-issues}), while the Kafka log itself
-provides a short, configurable replay window if a client needs to catch up.
+retains every published tick within its retention period, which is what a newly connected
+client replays to catch up on a run's past ticks.
 
-\textbf{Domain events.} Two per-aggregate event streams are persisted for recovery/event
+\textbf{Domain events.} Three per-aggregate event streams are persisted for recovery/event
 sourcing: \texttt{SimulationEvent} (\texttt{Initialized}, \texttt{Started}, \texttt{Paused},
 \texttt{Stopped}, \texttt{TickAdvanced}, \texttt{SpeedUpdated}, \texttt{TickDeltaUpdated}) for
-\texttt{SimulationActor}, and \texttt{EntityEvent} (\texttt{Initialized}, \texttt{Evolved}) for
-\texttt{EntityActor}. Separately, three kinds of \emph{outward notifications} are broadcast on
+\texttt{SimulationActor}, \texttt{EntityEvent} (\texttt{Initialized}, \texttt{Evolved}) for
+\texttt{EntityActor}, and \texttt{SimulationRegistryActor.Event}
+(\texttt{SimulationRegistered}, \texttt{SimulationUnregistered}) for the cluster-wide registry
+of existing simulations. Separately, three kinds of \emph{outward notifications} are broadcast on
 Kafka at run time: a per-entity telemetry snapshot, a per-tick global snapshot (environment and
 cable loads), and a control/status update (including the \texttt{degraded} flag, see
 \cref{fault-tolerance}) --- these are observations of state changes, not themselves part of the
@@ -798,8 +810,9 @@ static \texttt{SimulationModel} (graph, entity specs); the dynamic \texttt{Simul
 \texttt{Flow} per entity, and resolved load per \texttt{Cable}); the \texttt{SimulationActor}'s
 own lifecycle metadata (\texttt{Status}, current tick number, run-time configuration such as
 speed/tick delta, and transient failure-handling counters, \cref{behaviour}); and, at the
-backend-process level, an in-memory registry of which simulation ids/presets currently exist
-(\texttt{SimulationRegistryActor}), used purely to answer the ``list simulations'' query.
+cluster level, a registry of which simulation ids/presets currently exist
+(\texttt{SimulationRegistryActor}, itself event-sourced and running as a cluster singleton), used
+to answer the ``list simulations'' query.
 
 \cref{fig:domain-model-classes} depicts the core domain model introduced above.
 
@@ -1012,11 +1025,15 @@ the result); it has no explicit multi-state machine, only the presence/absence o
 configuration and the bookkeeping (\texttt{lastTick}, \texttt{lastFlow}) needed for
 idempotent retries.
 
-\textbf{\texttt{SimulationRegistryActor} --- minimal stateful bookkeeping.} It keeps an
-in-memory map from simulation id to preset name, updated on \texttt{RegisterSimulation}/
-\texttt{UnregisterSimulation} and read on \texttt{GetSimulations}; it is intentionally
-\emph{not} event-sourced, since it only indexes which simulations exist rather than their own
-state (\cref{availability}).
+\textbf{\texttt{SimulationRegistryActor} --- minimal, event-sourced bookkeeping.} It keeps a
+map from simulation id to preset name, updated on \texttt{RegisterSimulation}/
+\texttt{UnregisterSimulation} and read on \texttt{GetSimulations}. In cluster mode it runs as a
+\emph{cluster singleton} (one instance for the whole cluster, hosted on the oldest node) and is
+event-sourced: each registration/unregistration is first persisted as a
+\texttt{SimulationRegistered}/\texttt{SimulationUnregistered} event and only then acknowledged,
+so when the singleton migrates to another node after a crash it rebuilds the same list by
+replaying its events from the shared store (\cref{availability}). It uses the same
+\texttt{restartWithBackoff} strategy on persistence failures as the other two actors.
 
 \textbf{GUI --- effectively stateless from the server's point of view.} Views are purely
 declarative bindings; ViewModels are the only locally stateful components, caching the latest
@@ -1036,12 +1053,28 @@ state.
 
 \subsection{Data and Consistency Issues}\label{data-and-consistency-issues}
 
-\textbf{Persisted data.} Two things are persisted: (a) the full event history of
-every \texttt{SimulationActor} and \texttt{EntityActor} (lifecycle and per-tick evolution
-events), so that a crash never loses already
-confirmed simulation history; and (b) periodic snapshots of \texttt{EntityActor} state (every
-100 events, retaining the last 2, with older events deleted on snapshot) purely to bound
-recovery time after many ticks. Deliberately, nothing else is persisted server-side.
+\textbf{Persisted data.} Three things are persisted: (a) the events of every
+\texttt{SimulationActor} and \texttt{EntityActor} (lifecycle and per-tick evolution events), so
+that a crash never loses an already confirmed state transition; (b) periodic snapshots of
+\texttt{EntityActor} state (every 100 events, retaining the last 2) to bound recovery time
+after many ticks; and (c) the events of the \texttt{SimulationRegistryActor}, so that the list
+of existing simulations survives the loss of the node hosting it. The retention policies differ
+between the two simulation actors. \texttt{SimulationActor} keeps all of its events, which are
+small (lifecycle changes, and one \texttt{TickAdvanced} per tick carrying the environment and the
+tick number). \texttt{EntityActor} deletes the events already covered by its retained
+snapshots, so for each entity only the latest snapshots and the few hundred events after them
+are kept. The journal is therefore sufficient to rebuild the \emph{current} state of every
+simulation after a crash, but not the state of the grid at an arbitrary past tick.
+
+The per-tick history of a run is instead available, as a side effect, in the Kafka telemetry
+topics,
+which carry every entity state, net flow and cable load published at each tick. When a GUI
+opens a simulation it re-reads these topics from the beginning and
+replays every past tick through the statistics engine; this is how the statistics panel shows
+the run's evolution so far (the net-flow chart keeps the latest 200 ticks) rather than only
+the ticks received after the window was opened (\textsc{FR-9}). It is
+an observation log for clients, not part of the recovery path: losing it never affects the
+backend's state.
 
 \textbf{Storage mechanism.} Pekko Persistence's event-sourcing abstraction is used
 : each aggregate (one \texttt{SimulationActor} or
@@ -1049,8 +1082,14 @@ recovery time after many ticks. Deliberately, nothing else is persisted server-s
 append-only event log keyed by \texttt{PersistenceId}, which maps onto a
 key-value-shaped.
 There is no cross-aggregate join ever needed, since each actor only ever reads/replays its
-\emph{own} history. The current configuration uses the in-memory journal and a local
-flat-file snapshot store.
+\emph{own} history.
+
+In cluster mode (\texttt{ClusterMain}) both the journal and the snapshot store are custom Pekko
+Persistence plugins backed by a single \textbf{Redis} instance shared by every node
+(\texttt{RedisJournal} and \texttt{RedisSnapshotStore}). The
+store sits outside every backend node, so an actor re-spawned on a different node after a crash
+reads exactly the events and snapshots its previous incarnation wrote. The key-value shape of
+the data maps directly onto Redis structures
 
 \textbf{Store access patterns and concurrency.} Only the owning actor instance ever
 reads its own persisted events/snapshots, and only once, during recovery after a (re)start
@@ -1059,7 +1098,8 @@ are append-only and issued exclusively by that same actor instance. Cluster shar
 at most one live instance of a given \texttt{persistenceId} across the whole cluster at any
 time (the \emph{single-writer} invariant), so concurrent writes to the same aggregate's journal
 are structurally impossible by construction, and there is consequently no need for
-optimistic/pessimistic locking or conflict resolution on the write path.
+optimistic/pessimistic locking or conflict resolution on the write path. Every node \emph{could} technically write to any key in
+Redis, and it is sharding that guarantees only one of them ever writes a given \texttt{persistenceId}.
 
 \textbf{Data shared between components.} The per-tick \texttt{SimulationState} (environment,
 every entity's dynamic state, net flows, cable loads) is conceptually shared across
@@ -1079,6 +1119,24 @@ and recovers by replaying its own persisted event log. \emph{State} durability i
 entirely to the configured Pekko Persistence journal/snapshot-store plugin
 (\cref{data-and-consistency-issues}) rather than to ad-hoc application code, and the
 2-snapshot retention kept for each \texttt{EntityActor} is what keeps that replay fast.
+
+The two levels only work together because the store is shared: the surviving node reads the
+crashed node's events from Redis rather than from a journal that disappeared with it. In
+concrete terms, recovery from a node crash proceeds as follows:
+\begin{itemize}
+  \item the \texttt{SimulationActor} shard region is started with \emph{remember entities}
+  enabled, so the simulations that were active on the lost node are re-spawned on a surviving
+  node straight away, without waiting for a new HTTP request to reach them; each replays its
+  events and, on \texttt{RecoveryCompleted}, re-arms its tick timer if it was
+  \texttt{Running};
+  \item each \texttt{EntityActor} is re-spawned lazily by sharding on the next \texttt{Evolve}
+  sent to it, and recovers from its latest snapshot in Redis plus the events written after it;
+  \item the \texttt{SimulationRegistryActor} singleton is restarted on the new oldest node and
+  replays its registration events, so the list of simulations seen by the GUI is unchanged.
+\end{itemize}
+Redis itself is the one component of this chain that is not replicated: it runs as a single
+instance with no replica or Sentinel and, in the provided \texttt{compose.yml}, without a
+mounted volume. It removes the backend nodes as points of failure for state, but is itself one.
 
 \textbf{Heart-beating / timeout / retry.} Three mechanisms operate at different scopes:
 \begin{itemize}
@@ -1107,8 +1165,9 @@ it replies with its cached result instead of recomputing (and, crucially, withou
 second \texttt{Evolved} event) --- preventing duplicate energy accounting and duplicate
 persisted events under Pekko's at-least-once delivery semantics.
 
-\textbf{Error handling / supervision.} Both \texttt{SimulationActor} and \texttt{EntityActor}
-declare an explicit \texttt{onPersistFailure} supervision strategy
+\textbf{Error handling / supervision.} All three event-sourced actors (\texttt{SimulationActor},
+\texttt{EntityActor} and \texttt{SimulationRegistryActor}) declare an explicit
+\texttt{onPersistFailure} supervision strategy
 (\texttt{restartWithBackoff}, 200\,ms--5\,s, 0.2 jitter): on a crash or persistence failure,
 the faulty instance is torn down and a fresh one is restarted (transparently re-homed by
 cluster sharding if needed), which replays its persisted events/snapshot and, via the
@@ -1136,13 +1195,12 @@ unconditionally downed (its shard regions and hosted actors stop), so it cannot 
 writes and silently diverge from the majority side, preserving the single-writer invariant
 relied upon by event sourcing. A GUI client connected to the minority side simply loses its
 HTTP/Kafka connection and surfaces that as a disconnection, rather than being fooled into
-showing locally-computed, inconsistent data. The in-memory
-\texttt{SimulationRegistryActor} follows a deliberately lighter-weight
-strategy: since it only indexes which simulation ids/presets currently exist rather than any
-simulation's actual state, keeping it as plain in-memory bookkeeping outside the
-event-sourcing path is proportionate to that narrow responsibility, while durability of what
-actually matters --- each simulation's own state --- remains guaranteed independently by its
-\texttt{SimulationActor}/\texttt{EntityActor} event log.
+showing locally-computed, inconsistent data. The \texttt{SimulationRegistryActor} follows the
+same logic: as a cluster singleton it lives on exactly one node of the surviving majority, and
+because it is event-sourced into the shared store, moving it to another node (after a crash or
+after the minority is downed) loses no registered simulation. Once the partition is resolved,
+the actors re-spawned on the majority side read from Redis exactly the state that was last
+persisted before the split.
 
 \section{Implementation}\label{implementation}
 
@@ -1171,8 +1229,15 @@ binary footprint, given the volume of per-tick, per-entity messages; the one exc
 lightweight control-channel broadcast (status/speed/tick-delta/degraded), which uses a minimal
 hand-rolled pipe-delimited UTF-8 string (\texttt{SimulationControlCodec}), since a handful of
 primitive fields did not justify a full schema. Pekko's own remote messages (actor protocol case
-classes crossing node boundaries inside the cluster) are serialized with the
-\texttt{pekko-serialization-jackson} module.
+classes crossing node boundaries inside the cluster) use plain \textbf{Java serialization}: the
+project's \texttt{Serializable} marker trait, extended by every actor command, event, reply and
+state, and by the domain model classes they carry, extends \texttt{java.io.Serializable}, and
+\texttt{ClusterMain} explicitly enables Pekko's Java serializer
+(\texttt{allow-java-serialization = on}). The same serializer therefore also encodes the events
+and snapshots stored in Redis (\cref{data-and-consistency-issues}). It required no per-message
+schema or mapping, at the cost of a less compact format and of tying the stored data to the
+exact class definitions; the \texttt{pekko-serialization-jackson} module is on the classpath but
+is not bound to any message type.
 
 \subsection{Technological details}\label{technological-details}
 
@@ -1184,6 +1249,10 @@ classes crossing node boundaries inside the cluster) are serialized with the
   \item \textbf{Apache Kafka} 3.8.0 client library (\texttt{kafka-clients}) --- a
   \texttt{KafkaProducer} on the backend (\texttt{TelemetryPublisher}) and a
   \texttt{KafkaConsumer} on the GUI side, for all telemetry.
+
+  \item \textbf{Redis} 7 (\texttt{redis:7-alpine} container) with the \textbf{Jedis} 5.2.0
+  client --- the shared store behind the custom Pekko Persistence journal and snapshot-store
+  plugins used in cluster mode.
 
   \item \textbf{Protocol Buffers} 3.25.5 with \textbf{ScalaPB} 0.11.17 --- schema definition and
   Scala code generation for the Kafka message payloads, isolated in their own \texttt{protocols}
@@ -1233,9 +1302,12 @@ engine, whose module was developed test-first (TDD).
 
 \textbf{Actor and HTTP-route testing.} \texttt{EntityActorSpec} and \texttt{SimulationActorSpec}
 exercise the two event-sourced behaviours directly through Pekko's
-\texttt{ActorTestKit}/\texttt{PersistenceTestKit}: initialization, state carried forward across
+\texttt{ActorTestKit} and \texttt{PersistenceTestKit}: initialization, state carried forward across
 ticks, event persistence and replay after a restart, and snapshot persistence once the
-retention threshold (100 events) is reached. \texttt{SimulationControlRoutesTest} drives the
+retention threshold (100 events) is reached. The persistent registry is checked in
+\texttt{SimulationRegistryActorTest}: stopped and re-spawned with the same
+\texttt{PersistenceId}, it recovers the simulations registered before the stop. Finally,
+\texttt{SimulationControlRoutesTest} drives the
 HTTP layer (\texttt{SimulationControlRoutes}) through \texttt{pekko-http-testkit} without a real
 socket, checking the simulation-listing and preset-validation paths.
 
@@ -1268,7 +1340,7 @@ updates its reactive snapshot/statistics signals accordingly.
 project's crash tests for its two external dependencies: pointing the HTTP client at an
 unreachable host confirms it fails with a connect-timeout around its configured 5\,s timeout
 rather than hanging, and that \texttt{RemoteSimulationBuilder.build} falls back to
-\texttt{PAUSED} instead of blocking or throwing;}.
+\texttt{PAUSED} instead of blocking or throwing.
 
 \textbf{Automation.} Both Gradle tasks are wired into the project's GitHub Actions workflow
 (\texttt{.github/workflows/build.yml}), triggered on every push to \texttt{main}/\texttt{develop}
@@ -1290,36 +1362,95 @@ each view reflected the expected simulation state and transitions.
 
 \section{Deployment}\label{deployment}
 
-\begin{itemize}
-  \item should one install your software from scratch, how to do it?
-  %
-  \begin{itemize}
-    \item provide instructions
-    \item provide expected outcomes
-  \end{itemize}
+GridSim is deployed as two independent parts, matching the client--server split of
+\cref{architecture}: the \emph{backend}, a Pekko cluster together with the Kafka broker and
+the Redis store it depends on, shipped as a Docker Compose project; and the \emph{GUI}, a
+desktop JVM application run directly on each operator's machine. A third, single-process mode
+(\texttt{ActorMain}) exists only for local development and is not meant for deployment.
 
-  \item what software should be installed on the machines to run your project? which versions?
-  
-  \item should one set environment variables or configuration files?
-  
-  \item if you're using containerization (e.g.~Docker), 
-  describe how you engineered your deployment scrips (e.g. \texttt{docker-compose.yml} files)
+\textbf{Required software.}
+\begin{itemize}
+  \item \emph{Backend host}: Docker Engine with the Compose v2 plugin (\texttt{docker compose}).
+  Nothing else is needed: the backend image is built from source inside Docker, and Kafka,
+  Redis and Caddy are pulled as images (\texttt{apache/kafka:latest}, \texttt{redis:7-alpine},
+  \texttt{caddy:2-alpine}).
+  \item \emph{GUI host}: a \textbf{Java 21} JDK. The Gradle wrapper (\texttt{gradlew}) downloads
+  the right Gradle version on first use, and JavaFX is fetched as a regular dependency for the
+  current platform, so neither has to be installed separately.
+\end{itemize}
+
+\textbf{Installing and starting the backend from scratch.} From the root of the repository:
+\begin{verbatim}
+git clone <repository-url> GridSim-Distribuited
+cd GridSim-Distribuited
+docker compose up --build -d
+\end{verbatim}
+The first run builds the backend image, which takes a few minutes; later runs reuse it. The
+expected outcome is:
+\begin{itemize}
+  \item \texttt{docker compose ps} lists \texttt{gridsim-kafka} and \texttt{gridsim-redis} as
+  \emph{healthy}, three \texttt{backend} replicas and the \texttt{gridsim-gateway} container
+  as running;
+  \item \texttt{docker compose logs backend} shows, once per replica, the line
+  \texttt{Cluster Simulation API Server online at http://<ip>:8080/}, after the replicas have
+  joined a single cluster;
+  \item \texttt{curl http://localhost:8080/api/simulations} answers with a JSON object
+  containing an empty list of simulations.
+\end{itemize}
+The backend is stopped with \texttt{docker compose down}. Since no volume is mounted for Kafka
+or Redis, this also discards the persisted state and the telemetry history
+(\cref{data-and-consistency-issues}); \texttt{docker compose stop} keeps them.
+
+\textbf{Starting the GUI.} On the operator's machine, from the same repository:
+\begin{verbatim}
+./gradlew :app:run --args="gui \
+  --api=http://<backend-host>:8080 --kafka=<backend-host>:9092"
+\end{verbatim}
+Both arguments default to \texttt{localhost}, so they can be omitted when the GUI runs on the
+backend host; \cref{user-guide} describes how the GUI is used once started. Alternatively,
+\texttt{./gradlew :app:shadowJar} builds a self-contained jar
+(\texttt{app/build/libs/GridSim.jar}) that is started with \texttt{java -jar GridSim.jar gui
+\ldots}; \texttt{buildAmd64Jar}/\texttt{buildAarch64Jar} build the same jar for the other
+processor architecture, bundling the matching JavaFX native libraries.
+
+\textbf{Compose file.} \texttt{compose.yml} defines four services:
+\begin{itemize}
+  \item \texttt{kafka}: a single-node Kafka broker in KRaft mode (no ZooKeeper), with two
+  listeners: \texttt{kafka:29092} for the backend containers on the Compose network and
+  \texttt{localhost:9092}, published on the host, for GUI clients. A health check lists the
+  topics to tell when the broker is ready.
+  \item \texttt{redis}: the shared persistence store of \cref{data-and-consistency-issues},
+  published on port \texttt{6379} and checked with \texttt{redis-cli ping}.
+  \item \texttt{backend}: the image above, run as \texttt{replicas: 3} and started only once
+  both \texttt{kafka} and \texttt{redis} report healthy (\texttt{depends\_on} with
+  \texttt{condition: service\_healthy}), so no replica starts without its dependencies. The
+  replicas publish no port on the host, which is what allows several of them to run side by
+  side.
+  \item \texttt{gateway}: a Caddy reverse proxy, the single entry point of the HTTP API on host
+  port \texttt{8080}. It forwards each request to one of the backend replicas in round robin
+  and stops sending traffic for 5\,s to a replica that failed twice, so the API stays
+  reachable while a replica is down. Any replica can serve any request, because cluster
+  sharding and the cluster singleton route it to the node that owns the target actor
+  (\cref{infrastructure}).
 \end{itemize}
 
 \section{User Guide}\label{user-guide}
 
 \textbf{Starting the system.} The backend must be started before the GUI, since the GUI only
 ever talks to an already-running backend over HTTP/Kafka (\cref{implementation}) and has no
-local simulation logic of its own. Two dedicated Gradle tasks start each half of the
-application: \texttt{./gradlew :app:runBackend} launches \texttt{ActorMain}, which forms the
-Pekko cluster, binds the HTTP API on \texttt{0.0.0.0:8080}, and connects to Kafka on
-\texttt{localhost:9092}; \texttt{./gradlew :app:runGui} launches \texttt{GuiApp}, the JavaFX
-client, which by default points at that same \texttt{http://localhost:8080} API and
-\texttt{localhost:9092} Kafka broker. Both endpoints are overridable from the command line
+local simulation logic of its own. The backend is normally the clustered one, started with
+\texttt{docker compose up -d} as described in \cref{deployment}; for quick local development,
+\texttt{./gradlew :app:runBackend} instead launches the single-node \texttt{ActorMain}, which
+binds the HTTP API on \texttt{0.0.0.0:8080} and connects to a Kafka broker on
+\texttt{localhost:9092} (e.g.\ \texttt{docker compose up -d kafka}). In both cases
+\texttt{./gradlew :app:runGui} launches \texttt{GuiApp}, the JavaFX client, which by default
+points at \texttt{http://localhost:8080} and \texttt{localhost:9092}, i.e.\ at the gateway and
+broker of a backend on the same machine. Both endpoints are overridable from the command line
 (e.g.\ \texttt{./gradlew :app:runGui --args="--api=http://HOST:8080 --kafka=HOST:9092"}) to
 point the GUI at a backend running on a different machine, which is what makes the
-client--server split of \cref{architecture} usable across a real network rather than only on
-\texttt{localhost}.
+client--server split of \cref{architecture} usable across a real network; with the provided
+\texttt{compose.yml} this also requires Kafka to advertise an address reachable from that
+machine (\cref{deployment}).
 
 \textbf{Creating and watching a simulation.} On launch, the GUI opens on the
 \emph{Running Simulations} screen, listing whatever simulations are already registered on the
@@ -1413,8 +1544,9 @@ gives the system location transparency: \texttt{SimulationActor} addresses an \t
 by a stable id and never needs to know, or change, which physical node currently hosts it, which
 is precisely what would let the set of simulations and entities scale across more machines without
 touching the actors' own logic. Fault tolerance is handled the way a distributed system is
-expected to: event sourcing (\cref{data-and-consistency-issues}) makes every actor's state
-recoverable and replayable after a restart; a repeatedly-failing tick is retried rather than
+expected to: event sourcing into a store shared by all nodes
+(\cref{data-and-consistency-issues}) makes every actor's state recoverable after
+a restart, and also on a different node after the one hosting it has crashed; a repeatedly-failing tick is retried rather than
 treated as fatal, and that retry is idempotent --- entities already evolved for a tick are
 recognised and not re-evolved on a duplicate or retried message, which is exactly the
 at-least-once delivery semantics a distributed system has to assume rather than the
@@ -1429,11 +1561,16 @@ produces that telemetry. All of this is not only designed but verified: the cras
 \cref{automatic-testing} exercise the retry, idempotency, degraded-status and backoff-restart
 behaviour against an actually failing dependency, not only against a diagram.
 
-\textbf{Weaknesses of the product.} The most significant one is that persistence undermines part of what the cluster is for: both the event journal and
-the snapshot store live on whichever single node currently hosts a given shard
-(\cref{data-and-consistency-issues}), with nothing replicated to any other node, so losing that one
-node still loses the simulation regardless of how many other nodes are in the cluster. The same
-single-point-of-failure pattern repeats one layer up, on the Kafka side: every producer and
+\textbf{Weaknesses of the product.} The most significant one is that moving persistence into
+Redis has moved the single point of failure rather than removed it: the event journal and
+snapshot store no longer depend on any backend node, but they all depend on one Redis instance
+(\cref{fault-tolerance}), with no replica and, in the provided deployment, no persistent volume,
+so losing that instance still loses every simulation regardless of how many backend nodes are in
+the cluster. The journal plugin is also deliberately minimal: a batch of events is written with a
+pipelined sequence of commands rather than inside a Redis transaction, and both events and
+snapshots are stored with plain Java serialization (\cref{implementation}), which ties the
+stored data to the exact class versions that wrote it. The same
+single-point-of-failure pattern repeats on the Kafka side: every producer and
 consumer in the project is configured against one broker address, so the pub/sub channel that
 decouples backend and GUI concurrency is itself not fault-tolerant. Finally, none of the HTTP
 control API or the Kafka topics require any credentials, which is a concurrency-adjacent weakness
@@ -1442,15 +1579,6 @@ telemetry for every simulation, with no isolation between concurrently running s
 their ids.
 
 \section{Future works}\label{future-works}
-
-\textbf{Durable, replicated persistence.} The backend's event journal is currently the
-in-memory Pekko Persistence plugin (\cref{implementation}), so a simulation's entire tick/event
-history is lost the moment the process restarts; the
-local snapshot store survives a restart but not a lost disk. A production-ready version would
-swap both plugins for a networked one so that \texttt{EntityActor} and \texttt{SimulationActor}
-state is replicated outside the node that hosts the shard, which is also the missing piece needed
-to make cluster sharding's shard rebalancing (\cref{fault-tolerance}) actually move a simulation to
-a surviving node after a crash rather than merely resume it in place after a restart.
 
 \textbf{Authentication and authorization.} Neither the HTTP control API nor the Kafka topics
 require any credentials (\cref{implementation}), which is acceptable on the trusted local network
@@ -1462,14 +1590,15 @@ would mean enabling SASL/TLS on the broker and configuring matching credentials 
 
 \textbf{System health checks.} There is currently no endpoint or signal that reports whether a
 backend node, or the cluster as a whole, is actually healthy: \texttt{SimulationControlRoutes}
-only exposes per-simulation status (\cref{implementation}), and \texttt{ActorMain} never subscribes
-to Pekko Cluster's own membership events, so a node joining, leaving, or being marked unreachable
+only exposes per-simulation status (\cref{implementation}), and neither \texttt{ActorMain} nor
+\texttt{ClusterMain} subscribes to Pekko Cluster's own membership events, so a node joining, leaving, or being marked unreachable
 by the Split Brain Resolver (\cref{fault-tolerance}) produces no observable signal outside of the
-cluster's internal logs. Adding the \texttt{pekko-management} module's cluster-health HTTP routes would give each node a liveness/readiness probe, which is also what a real multi-node
-deployment would need in order for an external orchestrator to know when a
-node is safe to route traffic to, or when it should be restarted.
+cluster's internal logs. The Caddy gateway of the containerized deployment (\cref{deployment}) only compensates in part:
+it notices a dead replica \emph{passively}, after requests to it have failed, and cannot tell a
+replica whose process is up but has not yet joined the cluster from a healthy one. Adding the
+\texttt{pekko-management} module's cluster-health HTTP routes would give each node a
+liveness/readiness probe, which the gateway could poll actively and an external orchestrator
+could use to know when a node is safe to route traffic to, or when it should be restarted.
 
-\bibliographystyle{plain}
-\bibliography{references}
 
 \end{document}
