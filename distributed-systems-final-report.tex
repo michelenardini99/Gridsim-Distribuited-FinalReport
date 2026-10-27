@@ -1324,23 +1324,36 @@ persistence failure on either actor is checked to restart it with backoff and re
 (re-arming the tick timer for \texttt{SimulationActor}, replaying events for
 \texttt{EntityActor}) rather than losing state.
 
-\textbf{Integration testing.} Four specs under \texttt{app/src/test/integration} run against a
-real Apache Kafka broker and are kept in a separate Gradle task, \texttt{integrationTest}, so
+\textbf{Integration testing.} Five specs under \texttt{app/src/test/integration} run against
+real external dependencies and are kept in a separate Gradle task, \texttt{integrationTest}, so
 that the default \texttt{test} task (used in CI) never depends on Docker:
-\texttt{integrationTest} itself depends on a \texttt{startKafkaContainer} task that launches an
-\texttt{apache/kafka:latest} container (reusing one already listening on 9092, if present) and
-is finalized by a matching \texttt{stopKafkaContainer} task. \texttt{KafkaTelemetryIntegrationSpec}
+\texttt{integrationTest} depends on a \texttt{startKafkaContainer} task that launches an
+\texttt{apache/kafka:latest} container and a \texttt{startRedisContainer} task that launches a
+\texttt{redis:7-alpine} container (each reusing an instance already listening on its default
+port, if present), and is finalized by the matching \texttt{stopKafkaContainer}/
+\texttt{stopRedisContainer} tasks. \texttt{KafkaTelemetryIntegrationSpec}
 publishes real entity, tick, and multi-entity/multi-tick telemetry from
 \texttt{EntityActor}/\texttt{SimulationActor} and consumes it back with a plain
 \texttt{KafkaConsumer}, checking that the decoded Protobuf matches the original domain state
 exactly. \texttt{RemoteSimulationBuilderIntegrationSpec} goes one step further, consuming that
 same Kafka telemetry from the GUI side and checking that \texttt{RemoteSimulationBuilder}
 updates its reactive snapshot/statistics signals accordingly.
-\texttt{HttpApiUnavailableIntegrationSpec} and \texttt{KafkaUnavailableIntegrationSpec} are the
-project's crash tests for its two external dependencies: pointing the HTTP client at an
+\texttt{HttpApiUnavailableIntegrationSpec} and \texttt{KafkaUnavailableIntegrationSpec} are
+crash tests for the system's two GUI-facing external dependencies: pointing the HTTP client at an
 unreachable host confirms it fails with a connect-timeout around its configured 5\,s timeout
 rather than hanging, and that \texttt{RemoteSimulationBuilder.build} falls back to
-\texttt{PAUSED} instead of blocking or throwing.
+\texttt{PAUSED} instead of blocking or throwing. \texttt{ClusterResilienceIntegrationSpec} is a
+chaos test for the backend cluster itself: it forms a real 3-node Pekko cluster --- three
+separate \texttt{ActorSystem}s wired with the same cluster sharding, cluster singleton and
+Redis-backed persistence configuration as \texttt{ClusterMain} --- and crashes individual nodes
+outright (abrupt \texttt{ActorSystem} termination, with no graceful cluster leave) to check that
+the \texttt{SimulationRegistryActor} singleton is re-elected on a surviving node and recovers its
+Redis-backed registrations, that cluster sharding lazily re-hosts an \texttt{EntityActor} on a
+live node after its original node crashes and that the re-hosted actor replays its last
+persisted tick from Redis and answers a retried \texttt{Evolve} idempotently rather than from an
+empty state, and that the keep-majority Split Brain Resolver self-downs the minority side when
+two of three nodes crash near-simultaneously. The whole spec is \texttt{assume}-skipped, rather
+than failed, when Redis or Kafka are not reachable locally.
 
 \textbf{Automation.} Both Gradle tasks are wired into the project's GitHub Actions workflow
 (\texttt{.github/workflows/build.yml}), triggered on every push to \texttt{main}/\texttt{develop}
@@ -1521,62 +1534,64 @@ dashboard.
 
 \subsection{Michele Nardini}\label{self-evaluation-nardini}
 
-\textbf{Role.} Within the group, I was mainly responsible for the project's core domain model ---
-\texttt{House}, \texttt{Battery} and the
-\texttt{EnergyResolver} type-class hierarchy that \cref{modelling} is built on --- together with
-large parts of the simulation engine and actor-model layer: decoupling \texttt{FlowSolver} from
-\texttt{SimulationEngine} so either power-flow solver can be plugged in, introducing cancellable
-scheduled ticking, and implementing the tick-validation and fault-tolerance behaviour described in
-\cref{fault-tolerance}, which I validated directly by writing the \texttt{EntityActor},
-\texttt{SimulationActor}, and HTTP/Kafka crash tests listed in \cref{automatic-testing}. On the GUI
-side, I migrated the \emph{Scenario Selection}, \emph{Entity Details} and \emph{Summary} views to
-the MVVM pattern of \cref{behaviour}, including the \texttt{DetailExtractor} component that reads
-entity state for the view.
+\textbf{Role.} Within the group, I was mainly responsible for the project's actor-model layer and
+for how its actors interact with the rest of the system:  the
+scatter/gather exchange a tick performs between \texttt{SimulationActor} and its
+\texttt{EntityActor}s, cluster sharding's location-transparent addressing of entities, and the
+tick-validation, retry-with-backoff, idempotency and degraded-status behaviour of
+\cref{fault-tolerance}.
 
-\subsection{System Evaluation}
+A second, equally central part of my work was verifying the correctness of the whole distributed
+system through crash testing. Beyond the fault-injection cases in \texttt{EntityActorSpec} and
+\texttt{SimulationActorSpec} that exercise the actor-level retry, idempotency and
+degraded-status behaviour against an actor that is actually made to fail
+(\cref{automatic-testing}), I designed and implemented the system-level crash tests
+\texttt{HttpApiUnavailableIntegrationSpec} and \texttt{KafkaUnavailableIntegrationSpec}, which
+point the GUI's \texttt{HttpSimulationApiClient} and Kafka consumer at an unreachable backend and
+broker respectively and check that the communication contract between the GUI and the HTTP
+control API degrades predictably --- a connect-timeout around the configured 5\,s bound and a
+fallback to \texttt{PAUSED} in \texttt{RemoteSimulationBuilder.build} --- instead of hanging or
+crashing the client. I extended this effort to the cluster itself with
+\texttt{ClusterResilienceIntegrationSpec} (\cref{automatic-testing}), which forms a real 3-node
+Pekko cluster wired with the same cluster sharding, cluster singleton and Redis-backed
+persistence configuration as \texttt{ClusterMain} and crashes individual nodes outright to check
+that the \texttt{SimulationRegistryActor} singleton is re-elected and recovers its registrations,
+that a re-hosted \texttt{EntityActor} replays its last persisted tick from Redis and answers a
+retried \texttt{Evolve} idempotently instead of from an empty state, and that the keep-majority
+Split Brain Resolver self-downs the minority side when two of three nodes crash
+near-simultaneously. Together, these tests are what let the fault-tolerance behaviour described
+on paper in \cref{fault-tolerance} be checked against an actually failing dependency, both inside
+a single actor, across the HTTP/Kafka boundary that connects the GUI to the backend, and across
+the cluster's own node boundaries.
 
-\textbf{Strengths of the product.} The actor model is used consistently rather than only
-nominally: every \texttt{EntityActor} and \texttt{SimulationActor} owns its state exclusively and
-is only ever touched through messages, so even though every tick evolves many entities
-conceptually "in parallel", there is no shared mutable state and therefore no lock and no data
-race to get wrong, by construction rather than by discipline. On top of that, cluster sharding
-gives the system location transparency: \texttt{SimulationActor} addresses an \texttt{EntityActor}
-by a stable id and never needs to know, or change, which physical node currently hosts it, which
-is precisely what would let the set of simulations and entities scale across more machines without
-touching the actors' own logic. Fault tolerance is handled the way a distributed system is
-expected to: event sourcing into a store shared by all nodes
-(\cref{data-and-consistency-issues}) makes every actor's state recoverable after
-a restart, and also on a different node after the one hosting it has crashed; a repeatedly-failing tick is retried rather than
-treated as fatal, and that retry is idempotent --- entities already evolved for a tick are
-recognised and not re-evolved on a duplicate or retried message, which is exactly the
-at-least-once delivery semantics a distributed system has to assume rather than the
-exactly-once semantics it would be convenient (but wrong) to assume; and the Split Brain
-Resolver's \texttt{keep-majority} strategy gives the cluster a principled, deterministic answer to
-a network partition instead of leaving split-brain behaviour undefined. Finally, the backend and
-every GUI client are decoupled through Kafka's publish/subscribe telemetry channel
-(\cref{implementation}): several GUI instances can watch the same simulation concurrently without
-the backend tracking who is listening, and because publishing is fire-and-forget from the
-backend's side, a slow or disconnected GUI consumer cannot slow down or block the tick loop that
-produces that telemetry. All of this is not only designed but verified: the crash tests in
-\cref{automatic-testing} exercise the retry, idempotency, degraded-status and backoff-restart
-behaviour against an actually failing dependency, not only against a diagram.
+\textbf{Strengths of my contribution.} Modelling each simulation and entity as an
+independently-addressable, event-sourced actor that owns its state exclusively, and only ever
+exposes it through messages, removes an entire class of concurrency bugs by construction: there
+is no shared mutable state between entities evolving "in parallel" on the same tick, so there is
+never a lock, a race condition or a visibility bug to get wrong. Layering cluster sharding on top
+of that gives the system location transparency almost for free, since \texttt{SimulationActor}
+addresses an \texttt{EntityActor} purely by a stable id. The crash-test work follows the same
+principle of verifying rather than assuming: instead of only describing retry, idempotency,
+degraded-status and cluster-recovery behaviour, I made it the subject of tests that trigger an
+actual failure (a timed-out entity, an unreachable broker, an unreachable HTTP host, an abruptly
+crashed cluster node) and check the system's reaction, which caught corner cases --- such as a
+retried tick needing to recognise entities
+already evolved for it --- that a purely manual check of the design would likely have missed.
 
-\textbf{Weaknesses of the product.} The most significant one is that moving persistence into
-Redis has moved the single point of failure rather than removed it: the event journal and
-snapshot store no longer depend on any backend node, but they all depend on one Redis instance
-(\cref{fault-tolerance}), with no replica and, in the provided deployment, no persistent volume,
-so losing that instance still loses every simulation regardless of how many backend nodes are in
-the cluster. The journal plugin is also deliberately minimal: a batch of events is written with a
-pipelined sequence of commands rather than inside a Redis transaction, and both events and
-snapshots are stored with plain Java serialization (\cref{implementation}), which ties the
-stored data to the exact class versions that wrote it. The same
-single-point-of-failure pattern repeats on the Kafka side: every producer and
-consumer in the project is configured against one broker address, so the pub/sub channel that
-decouples backend and GUI concurrency is itself not fault-tolerant. Finally, none of the HTTP
-control API or the Kafka topics require any credentials, which is a concurrency-adjacent weakness
-too: in the current design, any client that can reach the cluster can issue commands or read
-telemetry for every simulation, with no isolation between concurrently running simulations beyond
-their ids.
+\textbf{Weaknesses of my contribution.} \texttt{ClusterResilienceIntegrationSpec} closes the
+cluster-level gap this evaluation originally had --- node crashes, singleton re-election and
+sharding recovery are now checked against the real wiring rather than only against the design
+described in \cref{fault-tolerance} --- but it approximates a crash by terminating a whole
+\texttt{ActorSystem}, which is not the same fault as a genuine asymmetric network partition
+(a node that stays up but becomes unreachable from some peers while still reachable from
+others); the keep-majority Split Brain Resolver is designed to treat the two alike, but only the
+crash side of that equivalence is exercised by an automatic test. Redis and Kafka themselves are
+also required to stay reachable for the whole spec (it is \texttt{assume}-skipped otherwise), so
+there is still no test that kills Redis mid-run and checks that an in-progress tick fails
+gracefully rather than losing state; that path remains only indirectly verified through the
+restart-with-backoff unit tests on \texttt{onPersistFailure}, and Redis returning corrupted
+rather than absent data is not covered by any automatic test either. Finally.
+
 
 \section{Future works}\label{future-works}
 
